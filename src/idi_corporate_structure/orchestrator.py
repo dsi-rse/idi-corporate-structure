@@ -87,6 +87,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument(
         "--sec-bucket-prefix",
         type=str,
+        required=True,
         help="S3 Bucket and prefix that contains SEC data (bucket-name/prefix)",
     )
 
