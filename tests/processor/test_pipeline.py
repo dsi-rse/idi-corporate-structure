@@ -2,6 +2,7 @@
 
 import queue
 import threading
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -228,6 +229,27 @@ class TestFetchCompanyMeta:
 
         assert meta.tickers == ("", "AAPL")
         assert ",".join(meta.tickers) == ",AAPL"
+
+    def test_caches_result_per_cik(self, pipeline):
+        """A CIK with multiple filings should only trigger one request.
+
+        Not one SEC submissions-JSON request per filing.
+        """
+        pipeline.sec_client.query_endpoint.return_value = {"data": {"stateOfIncorporation": "DE"}}
+
+        first = pipeline._fetch_company_meta("320193")
+        second = pipeline._fetch_company_meta("320193")
+
+        assert first == second
+        assert pipeline.sec_client.query_endpoint.call_count == 1
+
+    def test_does_not_cache_across_different_ciks(self, pipeline):
+        pipeline.sec_client.query_endpoint.return_value = {"data": {"stateOfIncorporation": "DE"}}
+
+        pipeline._fetch_company_meta("320193")
+        pipeline._fetch_company_meta("1067491")
+
+        assert pipeline.sec_client.query_endpoint.call_count == 2
 
 
 # ── load_input ────────────────────────────────────────────────────────────────
@@ -936,6 +958,27 @@ class TestSaveOutput:
         assert result_df.loc["Acme Mexico Sub", "parent_state_of_incorporation"] == "Cayman Islands"
         assert result_df.loc["Acme Mystery Sub", "location"] == ""
         assert result_df.loc["Acme Mystery Sub", "parent_state_of_incorporation"] == "Ireland"
+
+    def test_empty_list_does_not_raise_when_no_existing_file(self, pipeline):
+        """save_output([]) must not raise when no output file exists yet.
+
+        pd.DataFrame([]) has zero columns (not just zero rows), so indexing
+        combined_subsidiaries_df["location"] used to raise KeyError when
+        process() extracted nothing and no output file existed yet.
+        """
+        pipeline.save_output([])
+
+        assert not Path(pipeline.config.output_file).exists()
+
+    def test_empty_list_leaves_existing_file_untouched(self, pipeline):
+        subsidiaries = [self._make_subsidiary("Apple Operations International")]
+        pipeline.save_output(subsidiaries)
+
+        pipeline.save_output([])
+
+        result_df = pd.read_parquet(pipeline.config.output_file)
+        assert len(result_df) == 1
+        assert result_df.iloc[0]["name"] == "Apple Operations International"
 
 
 # ── display_stats ─────────────────────────────────────────────────────────────

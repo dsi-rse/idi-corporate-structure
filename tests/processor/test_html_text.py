@@ -73,3 +73,37 @@ class TestHtmlToText:
 
         assert "Visible Corp" in text
         assert "hidden" not in text
+
+    def test_cell_wrapped_in_div_does_not_fragment_row(self):
+        """A cell wrapped in its own <div> must not fragment the row it's in.
+
+        SEC filing software often wraps each cell's text in a <div> purely
+        for styling. Treating that as a paragraph break used to turn one
+        logical row into one paragraph per cell (name, %, counts), which
+        corrupted the chunker's row-count heuristics.
+        """
+        raw = (
+            "<table><tr>"
+            "<td><div>Freedom Finance JSC, Kazakhstan</div></td>"
+            "<td><div>100%</div></td>"
+            "<td><div>-</div></td>"
+            "<td><div>3</div></td>"
+            "</tr></table>"
+        )
+        text = html_to_text(raw)
+
+        assert text.split("\n\n") == ["Freedom Finance JSC, Kazakhstan 100% - 3"]
+
+    def test_nested_table_inside_cell_still_breaks_rows(self):
+        """A genuinely nested table inside a cell should still get row breaks."""
+        raw = (
+            "<table><tr><td>"
+            "<table><tr><td>Inner A</td></tr><tr><td>Inner B</td></tr></table>"
+            "</td></tr></table>"
+        )
+        text = html_to_text(raw)
+        lines = [line for line in text.split("\n") if line.strip()]
+
+        assert "Inner A" in lines
+        assert "Inner B" in lines
+        assert lines.index("Inner A") != lines.index("Inner B")
