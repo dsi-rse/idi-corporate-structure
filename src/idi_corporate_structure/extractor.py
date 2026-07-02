@@ -36,6 +36,7 @@ _BLOCK_TAGS = frozenset(
     }
 )
 _CELL_TAGS = frozenset({"td", "th"})
+_ROW_STRUCTURE_TAGS = frozenset({"table", "tr"})
 _INLINE_WS_RE = re.compile(r"[ \t\f\v]+")
 _MULTINEWLINE_RE = re.compile(r"\n{3,}")
 
@@ -46,6 +47,7 @@ _CHUNK_OVERLAP_CHARS = 400
 
 _INVISIBLE_CHARS_RE = re.compile(r"[\u200b\u200c\u200d\ufeff]")
 _PUNCT_RE = re.compile(r"[^\w]+")
+_TRAILING_FOOTNOTE_RE = re.compile(r"\s*\(\d+\)\s*$")
 
 
 class DocumentError(Exception):
@@ -333,8 +335,21 @@ class GptExtractor(Extractor):
         """
         ungrounded_location = 0
         if location:
-            name_pos = doc_text_normalized.find(_normalize(name))
-            name_len = len(_normalize(name))
+            normalized_name = _normalize(name)
+            name_pos = doc_text_normalized.find(normalized_name)
+            if name_pos == -1:
+                # Name only matched via the compact (punctuation-stripped) fallback
+                # - using -1 as-is would silently check the start of the
+                # document instead. Skip rather than report a bogus result.
+                self._logger.debug(
+                    "Skipping location-proximity check for %r (grounded via compact "
+                    "fallback, no exact position) @ %s",
+                    name,
+                    doc_url,
+                )
+                return ungrounded_location
+
+            name_len = len(normalized_name)
             window = doc_text_normalized[max(0, name_pos - 200) : name_pos + name_len + 200]
 
             if _normalize(location) not in window:
@@ -481,8 +496,16 @@ def html_to_text(raw_html: str) -> str:
             tag.insert_before(" ")
             tag.insert_after(" ")
         elif tag.name in _BLOCK_TAGS:
-            tag.insert_before("\n")
-            tag.insert_after("\n")
+            # Filing software commonly wraps each cell's text in its own block
+            # tag purely for styling (e.g. <td><div>...</div></td>).
+            # Only "table"/"tr" force a break even when nested in a cell, so a
+            # genuinely nested table still gets one.
+            if tag.name not in _ROW_STRUCTURE_TAGS and tag.find_parent(_CELL_TAGS) is not None:
+                tag.insert_before(" ")
+                tag.insert_after(" ")
+            else:
+                tag.insert_before("\n")
+                tag.insert_after("\n")
 
     text = _html.unescape(soup.get_text())
 
@@ -673,6 +696,13 @@ def dedup_by_name(raw_subs: list[dict]) -> list[dict]:
 def _clean_name(name: str) -> str:
     """Clean up subsidiary name.
 
+    Names are kept verbatim through extraction and grounding (see the system
+    prompt) so exhibit footnote markers like the trailing ``(1)`` in
+    "Freedom Bank Kazakhstan JSC, Kazakhstan(1)" survive into the model's
+    output. Grounding has already run by the time this is called, so it's
+    safe to strip that footnote noise here — mirrors the trailing-footnote
+    strip already applied to ``location`` in normalization.py.
+
     Args:
         name: String extracted for subsidiary name
 
@@ -682,4 +712,5 @@ def _clean_name(name: str) -> str:
     name = _html.unescape(name)
     name = _INVISIBLE_CHARS_RE.sub("", name)
     name = name.replace("\xa0", " ")
-    return " ".join(name.split())
+    name = " ".join(name.split())
+    return _TRAILING_FOOTNOTE_RE.sub("", name).strip()
