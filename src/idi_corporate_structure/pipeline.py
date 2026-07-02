@@ -164,6 +164,7 @@ class SubsidiaryPipeline(Pipeline):
         )
         self._results_lock = threading.Lock()
         self.rows = []
+        self._company_meta_cache: dict[str, CompanyMeta] = {}
 
     def _load_processed_accessions(self) -> set[str]:
         """Return accession numbers already present in the output parquet file.
@@ -181,6 +182,12 @@ class SubsidiaryPipeline(Pipeline):
     def _fetch_company_meta(self, cik: str) -> CompanyMeta:
         """Fetch per-CIK company metadata from the SEC submissions JSON.
 
+        Cached per pipeline instance since ``load_input`` calls this once per
+        filing — companies with multiple filings in the date range would
+        otherwise trigger a redundant SEC request per extra filing. Safe
+        without a lock: ``load_input`` runs single-threaded, before the
+        extraction worker threads are started.
+
         Args:
             cik: SEC CIK number for the filer.
 
@@ -188,11 +195,14 @@ class SubsidiaryPipeline(Pipeline):
             CompanyMeta populated from the submissions endpoint, with blank
             defaults for any fields missing from the response.
         """
+        if cik in self._company_meta_cache:
+            return self._company_meta_cache[cik]
+
         cik_10 = str(int(cik)).zfill(10)
         url = f"{self.CIK_JSON_URL}/CIK{cik_10}.json"
         data = self.sec_client.query_endpoint(sec_url=url).get("data", {})
         biz = data.get("addresses", {}).get("business", {})
-        return CompanyMeta(
+        company_meta = CompanyMeta(
             state_of_incorporation=data.get("stateOfIncorporation", ""),
             business_street1=biz.get("street1", ""),
             business_street2=biz.get("street2", ""),
@@ -204,6 +214,8 @@ class SubsidiaryPipeline(Pipeline):
             tickers=tuple(t or "" for t in data.get("tickers") or ()),
             exchanges=tuple(e or "" for e in data.get("exchanges") or ()),
         )
+        self._company_meta_cache[cik] = company_meta
+        return company_meta
 
     @staticmethod
     def _select_exhibit_documents(
@@ -612,6 +624,14 @@ class SubsidiaryPipeline(Pipeline):
         Returns:
             None
         """
+        if not processed_list:
+            # pd.DataFrame([]) has zero columns (not just zero rows), so if no
+            # output file exists yet, the location/parent_state_of_incorporation
+            # normalization below would KeyError on a columnless frame. There's
+            # nothing new to merge or normalize either way, so skip entirely.
+            self.logger.info("No new subsidiaries extracted; skipping save_output")
+            return
+
         # Save processed subsidiaries to a DataFrame
         subsidiaries_df = pd.DataFrame([dataclasses.asdict(s) for s in processed_list])
 
