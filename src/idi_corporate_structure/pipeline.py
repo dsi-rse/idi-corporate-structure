@@ -46,6 +46,15 @@ from idi_corporate_structure.types import (
 )
 
 
+class CompanyMetaFetchError(Exception):
+    """Raised when the SEC submissions request for a CIK fails.
+
+    Signals a failed request (as opposed to a successful-but-sparse response) so
+    callers can skip the filing and retry it on a later run instead of caching and
+    persisting a blank ``CompanyMeta``.
+    """
+
+
 class Pipeline(ABC):
     """Baseline class for processing piplines."""
 
@@ -193,21 +202,31 @@ class SubsidiaryPipeline(Pipeline):
 
         Returns:
             CompanyMeta populated from the submissions endpoint, with blank
-            defaults for any fields missing from the response.
+            defaults for any fields missing from a successful response.
+
+        Raises:
+            CompanyMetaFetchError: If the SEC request failed (the response
+                contains an ``error`` key). A successful-but-sparse response is
+                not an error and yields blank defaults.
         """
         if cik in self._company_meta_cache:
             return self._company_meta_cache[cik]
 
         cik_10 = str(int(cik)).zfill(10)
         url = f"{self.CIK_JSON_URL}/CIK{cik_10}.json"
-        data = self.sec_client.query_endpoint(sec_url=url).get("data", {})
+        response = self.sec_client.query_endpoint(sec_url=url)
+        if "error" in response:
+            # Request failed after the SEC client's retries. Raise instead of caching
+            # a blank CompanyMeta so the filing is skipped and retried on a later run.
+            raise CompanyMetaFetchError(cik, url)
+        data = response.get("data", {})
         biz = data.get("addresses", {}).get("business", {})
         company_meta = CompanyMeta(
             state_of_incorporation=data.get("stateOfIncorporation", ""),
             business_street1=biz.get("street1", ""),
             business_street2=biz.get("street2", ""),
             business_city=biz.get("city", ""),
-            business_state=biz.get("stateOrCounty", ""),
+            business_state=biz.get("stateOrCountry", ""),
             business_zip=biz.get("zipCode", ""),
             business_country=biz.get("country", ""),
             business_country_code=biz.get("countryCode", ""),
@@ -283,7 +302,22 @@ class SubsidiaryPipeline(Pipeline):
         for scraped_filing in scraped_filings:
             self.stats.increment("total_filing")
 
-            company_meta = self._fetch_company_meta(scraped_filing.cik)
+            try:
+                company_meta = self._fetch_company_meta(scraped_filing.cik)
+            except CompanyMetaFetchError:
+                # Retryable failure: not persisted to the registry, so the filing is
+                # neither written to output nor skipped on the next run.
+                self._record_failure(
+                    (scraped_filing.cik, scraped_filing.accession_number),
+                    FailureType.API_ERROR,
+                    "warning",
+                    "Failed to fetch company metadata for CIK %s - %s - will retry next run",
+                    scraped_filing.cik,
+                    scraped_filing.accession_number,
+                    stat_keys=("failed_filings",),
+                )
+                continue
+
             filing = Filing(
                 cik=scraped_filing.cik,
                 filing_date=scraped_filing.filing_date,
@@ -560,6 +594,23 @@ class SubsidiaryPipeline(Pipeline):
                 text = html_to_text(raw_exhibit.decode("utf-8", errors="replace"))
             else:
                 text = raw_exhibit.decode("utf-8", errors="replace")
+
+            if not text.strip():
+                # Don't enqueue empty text - it would burn an OpenAI call downstream.
+                # PDF parse failures are already recorded inside _extract_pdf_text;
+                # record the other empty cases (e.g. HTML that renders to nothing).
+                if ext != "PDF":
+                    self._record_failure(
+                        (filing.cik, filing.accession_number),
+                        FailureType.NO_EXHIBIT_CONTENT,
+                        "warning",
+                        "Exhibit %s - %s - %s produced empty text (%s).",
+                        doc.filename,
+                        filing.cik,
+                        filing.accession_number,
+                        doc.s3_key,
+                    )
+                continue
 
             exhibit_content.append({"url": doc.url, "data": text})
 

@@ -14,6 +14,7 @@ from idi_corporate_structure.extractor import (
     ExtractionTruncatedError,
 )
 from idi_corporate_structure.failures import FailureType
+from idi_corporate_structure.pipeline import CompanyMetaFetchError
 from idi_corporate_structure.types import CompanyMeta, Filing, Subsidiary
 from tests.conftest import make_exhibit_response
 
@@ -190,12 +191,43 @@ class TestFetchCompanyMeta:
         assert meta.tickers == ("AAPL",)
         assert meta.exchanges == ("Nasdaq",)
 
+    def test_maps_business_state_from_state_or_country(self, pipeline):
+        """business_state comes from the SEC ``stateOrCountry`` key (not ``stateOrCounty``)."""
+        pipeline.sec_client.query_endpoint.return_value = {
+            "data": {"addresses": {"business": {"stateOrCountry": "CA"}}}
+        }
+
+        meta = pipeline._fetch_company_meta("320193")
+
+        assert meta.business_state == "CA"
+
     def test_defaults_to_blank_fields_when_data_missing(self, pipeline):
         pipeline.sec_client.query_endpoint.return_value = {}
 
         meta = pipeline._fetch_company_meta("320193")
 
         assert meta == CompanyMeta()
+
+    def test_raises_on_sec_request_error(self, pipeline):
+        """A failed SEC request must raise, not silently yield a blank CompanyMeta."""
+        pipeline.sec_client.query_endpoint.return_value = {"error": "Timeout querying SEC"}
+
+        with pytest.raises(CompanyMetaFetchError):
+            pipeline._fetch_company_meta("320193")
+
+    def test_does_not_cache_on_sec_request_error(self, pipeline):
+        """After a failed request, a later call re-queries instead of returning a cached blank."""
+        pipeline.sec_client.query_endpoint.side_effect = [
+            {"error": "Timeout querying SEC"},
+            {"data": {"stateOfIncorporation": "DE"}},
+        ]
+
+        with pytest.raises(CompanyMetaFetchError):
+            pipeline._fetch_company_meta("320193")
+        meta = pipeline._fetch_company_meta("320193")
+
+        assert meta.state_of_incorporation == "DE"
+        assert pipeline.sec_client.query_endpoint.call_count == 2
 
     def test_zero_pads_cik_in_request_url(self, pipeline):
         pipeline.sec_client.query_endpoint.return_value = {}
@@ -309,6 +341,29 @@ class TestLoadInput:
 
         assert filings == []
         assert pipeline.stats.skipped_filings == 1
+
+    def test_skips_and_records_retryable_failure_on_meta_error(self, pipeline, mocker):
+        """A metadata fetch error skips the filing and records a retryable failure.
+
+        The failure must not be persisted to the registry, so the filing is
+        reprocessed on the next run rather than being marked processed with blank
+        parent metadata.
+        """
+        mocker.patch(
+            "idi_corporate_structure.pipeline.iter_filings_by_form_type",
+            return_value=[make_scraped_filing()],
+        )
+        mocker.patch.object(
+            pipeline,
+            "_fetch_company_meta",
+            side_effect=CompanyMetaFetchError("0000320193", "url"),
+        )
+
+        filings = pipeline.load_input()
+
+        assert filings == []
+        assert pipeline.stats.failed_filings == 1
+        assert ("0000320193", "0000320193-24-000123") not in pipeline.failure_registry
 
     def test_respects_input_sample_size(self, pipeline, mocker):
         mocker.patch.object(pipeline, "_INPUT_SAMPLE_SIZE", 1)
@@ -740,6 +795,29 @@ class TestFetchExhibit:
         result = pipeline._fetch_exhibit(sample_filing)
 
         assert result[0]["data"] == "extracted text"
+
+    def test_does_not_enqueue_empty_pdf_text(self, pipeline, sample_filing, mocker):
+        """A PDF that extracts to empty text is not enqueued (would burn an OpenAI call)."""
+        sample_filing.exhibit_documents = (make_scraped_document(filename="ex21.pdf"),)
+        mocker.patch("idi_corporate_structure.pipeline.load_content", return_value=b"%PDF")
+        mocker.patch.object(pipeline, "_extract_pdf_text", return_value="")
+
+        result = pipeline._fetch_exhibit(sample_filing)
+
+        assert result == []
+
+    def test_records_failure_for_empty_non_pdf_text(self, pipeline, sample_filing, mocker):
+        """HTML that renders to only whitespace is skipped and recorded as NO_EXHIBIT_CONTENT."""
+        sample_filing.exhibit_documents = (make_scraped_document(filename="ex21.htm"),)
+        mocker.patch(
+            "idi_corporate_structure.pipeline.load_content",
+            return_value=b"<html><body>   </body></html>",
+        )
+
+        result = pipeline._fetch_exhibit(sample_filing)
+
+        assert result == []
+        assert pipeline.stats.failed_subsidiaries == 1
 
     @pytest.mark.parametrize(
         "filename,stat_key",
