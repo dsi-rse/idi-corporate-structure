@@ -775,6 +775,141 @@ class TestPerChunkYieldLogging:
         assert not yield_warnings, "healthy-yield chunks should not warn"
 
 
+class TestRetryOutlierChunks:
+    """Re-extraction of sibling-outlier low-yield chunks in _summarize_chunks."""
+
+    @staticmethod
+    def _sub(name: str) -> dict:
+        return {"name": name, "location": "Delaware", "source_quote": name}
+
+    @classmethod
+    def _chunk(cls, prefix: str, n: int) -> str:
+        return "\n\n".join(f"{prefix}{i} LLC (Delaware)" for i in range(n))
+
+    def test_reextracts_sibling_outlier_chunk(self, mocker):
+        """A chunk whose yield is far below its siblings is re-extracted and merged."""
+        extractor = GptExtractor(openai_api_key="fake-key")
+        chunks = [self._chunk("A", 10), self._chunk("B", 10), self._chunk("C", 10)]
+        subs = [
+            [self._sub(f"A{i} LLC") for i in range(9)],  # yield 0.9
+            [self._sub(f"B{i} LLC") for i in range(9)],  # yield 0.9
+            [self._sub(f"C{i} LLC") for i in range(3)],  # yield 0.3 → outlier
+        ]
+        recover = mocker.patch.object(
+            extractor,
+            "_reextract_outlier",
+            return_value=[self._sub(f"C{i} LLC") for i in range(10)],
+        )
+
+        out = extractor._retry_outlier_chunks(chunks, subs, "ACME", "url")
+
+        recover.assert_called_once()
+        assert [len(s) for s in out] == [9, 9, 10]  # outlier recovered, siblings untouched
+
+    def test_uniformly_low_yield_not_retried(self, mocker):
+        """All-chunks-low (an input_rows artifact, e.g. VIASAT) must not trigger retries."""
+        extractor = GptExtractor(openai_api_key="fake-key")
+        recover = mocker.patch.object(extractor, "_reextract_outlier")
+        chunks = [self._chunk(p, 100) for p in ("A", "B", "C")]
+        subs = [[self._sub(f"{p}{i} LLC") for i in range(49)] for p in ("A", "B", "C")]  # ~0.49
+
+        out = extractor._retry_outlier_chunks(chunks, subs, "VIASAT", "url")
+
+        recover.assert_not_called()
+        assert [len(s) for s in out] == [49, 49, 49]
+
+    def test_healthy_chunks_not_retried(self, mocker):
+        extractor = GptExtractor(openai_api_key="fake-key")
+        recover = mocker.patch.object(extractor, "_reextract_outlier")
+        chunks = [self._chunk(p, 10) for p in ("A", "B", "C")]
+        subs = [[self._sub(f"{p}{i} LLC") for i in range(10)] for p in ("A", "B", "C")]  # 1.0
+
+        extractor._retry_outlier_chunks(chunks, subs, "ACME", "url")
+
+        recover.assert_not_called()
+
+    def test_single_chunk_never_retried(self, mocker):
+        """With no siblings there is no baseline to compare against."""
+        extractor = GptExtractor(openai_api_key="fake-key")
+        recover = mocker.patch.object(extractor, "_reextract_outlier")
+
+        extractor._retry_outlier_chunks([self._chunk("A", 10)], [[self._sub("A0 LLC")]], "X", "url")
+
+        recover.assert_not_called()
+
+    def test_reextract_outlier_splits_into_smaller_subchunks(self, mocker):
+        """_reextract_outlier re-summarizes the chunk in smaller entry-capped pieces."""
+        extractor = GptExtractor(openai_api_key="fake-key")
+        calls = []
+
+        def fake(doc):
+            calls.append(doc)
+            rows = [p for p in doc.split("\n\n") if p.strip()]
+            return {"subsidiaries": [self._sub(p.split(" (")[0]) for p in rows]}
+
+        mocker.patch.object(extractor, "_summarize", side_effect=fake)
+
+        recovered = extractor._reextract_outlier(self._chunk("Row", 60))  # 60 > _RETRY_MAX_ENTRIES
+
+        assert len(calls) >= 2  # split into multiple smaller calls
+        assert len({s["name"] for s in recovered}) == 60  # every distinct row recovered
+
+    def test_reextract_outlier_swallows_truncation(self, mocker):
+        """A truncating sub-chunk is skipped, not raised — retry is best-effort."""
+        extractor = GptExtractor(openai_api_key="fake-key")
+        mocker.patch.object(extractor, "_summarize", side_effect=ExtractionTruncatedError("boom"))
+
+        assert extractor._reextract_outlier(self._chunk("Row", 60)) == []
+
+
+class TestWindowedSubsequenceGrounding:
+    """Windowed in-order token fallback + control/zero-width stripping in grounding."""
+
+    def test_recovers_table_shattered_name(self):
+        """A name whose words are split across table columns is still grounded."""
+        from idi_corporate_structure.extractor import _is_name_in_document
+
+        # Name cell wrapped across rows, interleaved with the row's other columns.
+        doc = "PT Telekomunikasi ​ Mobile ​ 1995 ​ 70 ​ 70 selular ​ telecommunication"
+        assert _is_name_in_document("PT Telekomunikasi Selular", doc)
+
+    def test_rejects_tokens_scattered_beyond_window(self):
+        """Tokens present but far apart do not ground — the hallucination guard holds."""
+        from idi_corporate_structure.extractor import _is_name_in_document
+
+        doc = "Alpha " + ("filler " * 80) + "Beta"  # ~560 chars apart, > 250-char window
+        assert not _is_name_in_document("Alpha Beta", doc)
+
+    def test_single_token_not_resurrected_by_window(self):
+        from idi_corporate_structure.extractor import _is_name_in_document
+
+        assert not _is_name_in_document("Ghost", "Alpha Beta Gamma Holdings")
+
+    def test_windowed_match_logs_debug(self, mocker):
+        from idi_corporate_structure import extractor as ext_mod
+
+        mock_logger = mocker.patch.object(ext_mod, "get_logger")
+        doc = "PT Telekomunikasi ​ Mobile ​ 1995 selular ​ telecommunication"
+
+        ext_mod._is_name_in_document("PT Telekomunikasi Selular", doc)
+
+        assert mock_logger.return_value.debug.called
+        assert "windowed-subsequence" in mock_logger.return_value.debug.call_args[0][0]
+
+    def test_zero_width_space_stripped_in_grounding(self):
+        from idi_corporate_structure.extractor import _is_name_in_document
+
+        assert _is_name_in_document("FooBar Holdings LLC", "Foo​Bar Holdings LLC (Delaware)")
+
+    def test_control_char_stripped_in_grounding(self):
+        """A C0 control char embedded in both name and doc is normalized away consistently."""
+        from idi_corporate_structure.extractor import _is_name_in_document
+
+        assert _is_name_in_document(
+            "USCNHK Group\x01Limited", "USCNHK Group\x01Limited (Hong Kong)"
+        )
+
+
 class TestJnjChunkingFixture:
     """End-to-end chunking test against the real Johnson & Johnson Exhibit 21.
 

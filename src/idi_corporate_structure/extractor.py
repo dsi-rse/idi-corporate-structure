@@ -5,6 +5,7 @@ import html as _html
 import importlib.resources
 import json
 import re
+import statistics
 from abc import ABC, abstractmethod
 
 # Third-party imports
@@ -46,8 +47,18 @@ _CHUNK_MAX_ENTRIES = 75  # protects against per-chunk laziness
 _CHUNK_OVERLAP_CHARS = 400
 
 _INVISIBLE_CHARS_RE = re.compile(r"[\u200b\u200c\u200d\ufeff]")
+# C0 control characters that str.split() does NOT treat as whitespace (so they
+# survive into a name/document and break grounding). Excludes \t \n \r \x0b \x0c,
+# which split() already collapses.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
 _PUNCT_RE = re.compile(r"[^\w]+")
 _TRAILING_FOOTNOTE_RE = re.compile(r"\s*\(\d+\)\s*$")
+
+# Grounding: a multi-word name whose tokens appear in order within this many
+# characters is treated as present, recovering names that html_to_text shattered
+# across table columns. Kept tight so scattered tokens don't pass the guard.
+_SUBSEQUENCE_WINDOW_CHARS = 250
+_MIN_SUBSEQUENCE_TOKENS = 2  # single-token names use strict/compact only
 
 
 class DocumentError(Exception):
@@ -93,6 +104,13 @@ class GptExtractor(Extractor):
     _MAX_COMPLETION_TOKENS = 32768  # surfaces finish_reason="length" when truncation occurs
     _DEFAULT_MODEL = "gpt-4.1-nano"
     _LOW_YIELD_RATIO = 0.6  # per-chunk yield (output rows / input rows)
+    # Re-extract a chunk whose yield is below this fraction of its sibling
+    # chunks' median yield - a sharp outlier signals mid-document truncation,
+    # whereas a uniformly low yield usually means input_rows is a poor
+    # denominator for that layout (not real loss), so it is left alone.
+    _SIBLING_OUTLIER_FACTOR = 0.6
+    _RETRY_MAX_ENTRIES = 25  # smaller entry cap when re-extracting an outlier chunk
+    _MIN_CHUNKS_FOR_RETRY = 2  # need at least one sibling to judge an outlier
     _SYSTEM_PROMPT: str = (
         _PROMPTS.joinpath("gpt_extractor_system.txt").read_text(encoding="utf-8").strip()
     )
@@ -140,6 +158,16 @@ class GptExtractor(Extractor):
             self._logger.info("One-shot extraction truncated; retrying with chunking")
             return self._summarize_chunks(doc_text, company_name, doc_url)
 
+    @staticmethod
+    def _chunk_input_rows(chunk: str) -> int:
+        """Approximate the number of entity rows in a chunk (its paragraph count)."""
+        return chunk.count("\n\n") + 1
+
+    def _chunk_yield(self, chunk: str, chunk_subs: list[dict]) -> float:
+        """Return output-rows / input-rows for a chunk (0.0 when it has no rows)."""
+        input_rows = self._chunk_input_rows(chunk)
+        return len(chunk_subs) / input_rows if input_rows else 0.0
+
     def _log_chunk(
         self,
         chunk: str,
@@ -159,9 +187,9 @@ class GptExtractor(Extractor):
             i: The index of the chunk.
             num_chunks: The number of chunks.
         """
-        input_rows = chunk.count("\n\n") + 1
+        input_rows = self._chunk_input_rows(chunk)
         output_rows = len(chunk_subs)
-        yield_ratio = output_rows / input_rows if input_rows else 0.0
+        yield_ratio = self._chunk_yield(chunk, chunk_subs)
         log = self._logger.warning if yield_ratio < self._LOW_YIELD_RATIO else self._logger.info
         log(
             "%s chunk %d/%d: %d input rows → %d extracted (yield=%.2f) @ %s",
@@ -173,6 +201,95 @@ class GptExtractor(Extractor):
             yield_ratio,
             doc_url,
         )
+
+    def _reextract_outlier(self, chunk: str) -> list[dict]:
+        """Re-extract one low-yield chunk with a smaller entry cap.
+
+        Splitting the chunk into fewer-entry sub-chunks counters the per-chunk
+        "laziness" that makes the model return only part of a dense list. A
+        sub-chunk that truncates is logged and skipped rather than raised — the
+        retry is best-effort recovery layered on top of the original result.
+
+        Args:
+            chunk: The chunk text to re-extract.
+
+        Returns:
+            Raw subsidiary dicts recovered from the sub-chunks (possibly empty).
+        """
+        sub_chunks = _chunk_document(
+            chunk, _CHUNK_MAX_CHARS, _CHUNK_OVERLAP_CHARS, self._RETRY_MAX_ENTRIES
+        )
+        recovered: list[dict] = []
+        for sub_chunk in sub_chunks:
+            try:
+                recovered.extend(self._summarize(sub_chunk).get("subsidiaries", []))
+            except ExtractionTruncatedError:
+                self._logger.error("Retry sub-chunk truncated; keeping partial recovery")
+        return recovered
+
+    def _retry_outlier_chunks(
+        self,
+        chunks: list[str],
+        chunk_subs_list: list[list[dict]],
+        company_name: str,
+        doc_url: str,
+    ) -> list[list[dict]]:
+        """Re-extract chunks whose yield is a sharp outlier vs their siblings.
+
+        A per-chunk yield well below the sibling median signals mid-document
+        truncation (the model returned far fewer rows than the chunk holds). A
+        *uniformly* low yield, by contrast, usually means ``input_rows`` is a
+        poor denominator for that layout rather than real loss, so it is not
+        retried. Recovered rows are merged in and deduped by name.
+
+        Args:
+            chunks: The chunk texts, in order.
+            chunk_subs_list: Per-chunk extracted subsidiaries, aligned to ``chunks``.
+            company_name: Filing company name, for log lines.
+            doc_url: SEC URL of the exhibit, for log lines.
+
+        Returns:
+            ``chunk_subs_list`` with outlier chunks replaced by their merged
+            (original + recovered) subsidiaries.
+        """
+        if len(chunks) < self._MIN_CHUNKS_FOR_RETRY:
+            return chunk_subs_list
+
+        yields = [self._chunk_yield(c, subs) for c, subs in zip(chunks, chunk_subs_list)]
+
+        for i, (chunk, subs) in enumerate(zip(chunks, chunk_subs_list)):
+            sibling_median = statistics.median([y for j, y in enumerate(yields) if j != i])
+            is_outlier = (
+                yields[i] < self._LOW_YIELD_RATIO
+                and sibling_median >= self._LOW_YIELD_RATIO
+                and yields[i] < self._SIBLING_OUTLIER_FACTOR * sibling_median
+            )
+            if not is_outlier:
+                continue
+
+            self._logger.warning(
+                "%s chunk %d/%d yield %.2f is a sharp outlier (sibling median %.2f) - "
+                "re-extracting @ %s",
+                company_name,
+                i + 1,
+                len(chunks),
+                yields[i],
+                sibling_median,
+                doc_url,
+            )
+            merged = dedup_by_name(subs + self._reextract_outlier(chunk))
+            self._logger.info(
+                "%s chunk %d/%d retry: %d → %d rows after merge @ %s",
+                company_name,
+                i + 1,
+                len(chunks),
+                len(subs),
+                len(merged),
+                doc_url,
+            )
+            chunk_subs_list[i] = merged
+
+        return chunk_subs_list
 
     def _summarize_chunks(
         self, doc_text: str, company_name: str, doc_url: str
@@ -198,7 +315,7 @@ class GptExtractor(Extractor):
             "%s chunked extraction: %d chunks @ %s", company_name, len(chunks), doc_url
         )
 
-        all_subs: list[dict] = []
+        chunk_subs_list: list[list[dict]] = []
         for i, chunk in enumerate(chunks, 1):
             try:
                 result = self._summarize(chunk)
@@ -213,8 +330,11 @@ class GptExtractor(Extractor):
 
             chunk_subs = result.get("subsidiaries", [])
             self._log_chunk(chunk, chunk_subs, company_name, doc_url, i, len(chunks))
-            all_subs.extend(chunk_subs)
+            chunk_subs_list.append(chunk_subs)
 
+        chunk_subs_list = self._retry_outlier_chunks(chunks, chunk_subs_list, company_name, doc_url)
+
+        all_subs = [sub for chunk_subs in chunk_subs_list for sub in chunk_subs]
         return all_subs, len(chunks)
 
     def _get_request_data_json(self, document: str) -> dict:
@@ -633,6 +753,49 @@ def _compact(s: str) -> str:
     return _PUNCT_RE.sub("", _normalize(s))
 
 
+def _name_tokens_in_window(name: str, document_normalized: str) -> bool:
+    """Return True if the name's tokens appear in order within a bounded window.
+
+    Recovers multi-word names that ``html_to_text`` shattered across table
+    columns: when a wrapped name cell is linearized row-major, the row's other
+    columns land between the name's words, so the full name is not a contiguous
+    substring even though every word is present, in order, and close together.
+
+    Every token must appear in order within ``_SUBSEQUENCE_WINDOW_CHARS`` of the
+    first, so a fabricated name whose words happen to be scattered far apart is
+    still rejected — this preserves the hallucination guard. Single-token names
+    are not eligible: strict/compact already cover a lone token, and admitting
+    it here would only loosen the check.
+
+    Args:
+        name: Candidate subsidiary name.
+        document_normalized: The already-``_normalize``d document text.
+
+    Returns:
+        True if the name's tokens form an in-order, windowed subsequence.
+    """
+    tokens = _normalize(name).split()
+    if len(tokens) < _MIN_SUBSEQUENCE_TOKENS:
+        return False
+
+    start = 0
+    while True:
+        first = document_normalized.find(tokens[0], start)
+        if first == -1:
+            return False
+        pos = first + len(tokens[0])
+        matched = True
+        for token in tokens[1:]:
+            nxt = document_normalized.find(token, pos)
+            if nxt == -1 or nxt - first > _SUBSEQUENCE_WINDOW_CHARS:
+                matched = False
+                break
+            pos = nxt + len(token)
+        if matched:
+            return True
+        start = first + 1
+
+
 def _is_name_in_document(name: str, document: str) -> bool:
     """Check if a name appears in the document (the source of truth).
 
@@ -640,20 +803,23 @@ def _is_name_in_document(name: str, document: str) -> bool:
     back to a compact (punctuation-stripped) match to catch cases where the
     model returned a name with minor punctuation or whitespace differences
     from the exhibit (e.g. dropped parentheses, "Health Care" vs
-    "Healthcare").
+    "Healthcare"). Finally, for multi-word names, falls back to a windowed
+    in-order token match to recover names shattered across table columns by
+    ``html_to_text`` linearization.
 
     Args:
         name: The name to check.
         document: The document text to check for the name.
 
     Returns:
-        True if the name is found via the strict or compact match,
+        True if the name is found via the strict, compact, or windowed match,
         False otherwise.
     """
     if not name:
         return False
 
-    if _normalize(name) in _normalize(document):
+    document_normalized = _normalize(document)
+    if _normalize(name) in document_normalized:
         return True
 
     if _compact(name) in _compact(document):
@@ -662,14 +828,27 @@ def _is_name_in_document(name: str, document: str) -> bool:
         )
         return True
 
+    if _name_tokens_in_window(name, document_normalized):
+        get_logger(__name__).debug(
+            "Name %r matched via windowed-subsequence fallback (table-shattered layout)", name
+        )
+        return True
+
     return False
 
 
 def _normalize(s: str) -> str:
-    """Decode HTML entities, normalize apostrophes and whitespace, and lowercase."""
+    r"""Decode HTML entities, normalize apostrophes and whitespace, and lowercase.
+
+    Zero-width and control characters are stripped so they cannot wedge
+    themselves between a name's words and defeat the grounding substring match
+    (e.g. an exhibit that renders ``VisitIQ,\r2LLC`` or ``USCNHK Group\x01...``).
+    """
     s = _html.unescape(s)
     s = s.replace("\u2019", "'").replace("\u2018", "'")
     s = s.replace("\u201c", '"').replace("\u201d", '"')
+    s = _INVISIBLE_CHARS_RE.sub("", s)
+    s = _CONTROL_CHARS_RE.sub(" ", s)
     return " ".join(s.split()).lower()
 
 
