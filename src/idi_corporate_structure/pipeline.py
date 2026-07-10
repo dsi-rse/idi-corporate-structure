@@ -4,13 +4,12 @@
 import dataclasses
 import datetime
 import io
-import json
 import os
 import queue
 import re
 import threading
-import zipfile
 from abc import ABC, abstractmethod
+from itertools import islice
 
 # Third party imports
 import pandas as pd
@@ -18,8 +17,8 @@ import pdfplumber
 from idi_ftm2j_shared.api import SecClient
 from idi_ftm2j_shared.failures import FailureRegistry
 from idi_ftm2j_shared.logs import get_logger
-from idi_ftm2j_shared.storage import open_zip
-from tqdm import tqdm
+from idi_ftm2j_shared.sec import ScrapedDocument, ScrapedFiling, iter_filings_by_form_type
+from idi_ftm2j_shared.storage import load_content
 
 # Application imports
 from idi_corporate_structure.extractor import (
@@ -38,12 +37,22 @@ from idi_corporate_structure.normalization import (
     normalize_subsidiary_location,
 )
 from idi_corporate_structure.types import (
-    SUPPORTED_EXHIBIT_EXTENSIONS,
+    TARGET_FORM_TYPES,
+    CompanyMeta,
     Filing,
     PipelineConfig,
     PipelineStats,
     Subsidiary,
 )
+
+
+class CompanyMetaFetchError(Exception):
+    """Raised when the SEC submissions request for a CIK fails.
+
+    Signals a failed request (as opposed to a successful-but-sparse response) so
+    callers can skip the filing and retry it on a later run instead of caching and
+    persisting a blank ``CompanyMeta``.
+    """
 
 
 class Pipeline(ABC):
@@ -125,6 +134,7 @@ class Pipeline(ABC):
         start_time = datetime.datetime.now()
 
         input_data = self.load_input()
+        self.logger.info("Located %d filings with exhibits to process", len(input_data))
 
         if input_data:
             results = self.process(input_data)
@@ -140,15 +150,9 @@ class Pipeline(ABC):
 class SubsidiaryPipeline(Pipeline):
     """Pipeline that fetches Exhibit 21 filings from SEC EDGAR and extracts subsidiary data."""
 
-    EX = re.compile(r"EX[-\d]", re.IGNORECASE)
-    IS_10K = re.compile("10-?K")
-    IS_20F = re.compile("20-?F")
-    IS_DATE = re.compile("[0-9]{4}-[0-9]{2}-[0-9]{2}")
-    TWENTYONE = re.compile("[^0-9]21")
-    EIGHT = re.compile("[^0-9]8")
-    IS_OVERFLOW = re.compile(r"-submissions-\d+\.json$")
-
+    CIK_JSON_URL = "https://data.sec.gov/submissions"
     _INPUT_SAMPLE_SIZE = int(os.environ.get("INPUT_SAMPLE_SIZE", 0))
+    _LOG_EVERY = 5
 
     def __init__(
         self, config: PipelineConfig, sec_client: SecClient, extractor: GptExtractor
@@ -167,315 +171,187 @@ class SubsidiaryPipeline(Pipeline):
             classifier=CorporateStructureFailureClassifier(),
             flush_every=config.failure_flush_every,
         )
+        self._results_lock = threading.Lock()
         self.rows = []
+        self._company_meta_cache: dict[str, CompanyMeta] = {}
 
-    def _retrieve_overflow_filings(
-        self, data: dict, cik: str, zf: zipfile.ZipFile
-    ) -> tuple[list, list, list, list]:
-        """Retrieve overflow filings from the SEC submissions JSON.
-
-        Args:
-            data: Data to retrieve overflow filings from
-            cik: Identifier of file data was retrieved from
-            zf: Open ZipFile to read from.
+    def _load_processed_accessions(self) -> set[str]:
+        """Return accession numbers already present in the output parquet file.
 
         Returns:
-            Tuple of lists of forms, accession numbers, primary documents, and filing dates.
-        """
-        forms = []
-        accession_numbers = []
-        primary_documents = []
-        filing_dates = []
-        for entry in data.get("filings", {}).get("files", []):
-            overflow_filename = entry.get("name", "")
-            if not overflow_filename:
-                continue
-
-            if (cik, overflow_filename) in self.failure_registry:
-                self.logger.debug(
-                    "Skipping overflow file — permanent failure recorded: %s", overflow_filename
-                )
-                self.stats.increment("skipped_filings")
-                continue
-
-            try:
-                with zf.open(overflow_filename) as of:
-                    overflow = json.load(of)
-
-                forms += overflow.get("form", [])
-                accession_numbers += overflow.get("accessionNumber", [])
-                primary_documents += overflow.get("primaryDocument", [])
-                filing_dates += overflow.get("filingDate", [])
-
-            except KeyError:
-                self._record_failure(
-                    (cik, overflow_filename),
-                    FailureType.NO_OVERFLOW_FILINGS,
-                    "error",
-                    "Overflow file not found: %s",
-                    overflow_filename,
-                    stat_keys=("failed_filings",),
-                )
-
-        return forms, accession_numbers, primary_documents, filing_dates
-
-    def _zip_file_data(
-        self, data: dict, filename: str, cik: str, zf: zipfile.ZipFile
-    ) -> zip | None:
-        """Locate and return zipped filing data for a single CIK JSON file.
-
-        Combines recent filings from ``data`` with any overflow filings referenced
-        in ``data["filings"]["files"]``, then validates that all four parallel lists
-        (forms, accession numbers, primary documents, filing dates) have the same
-        length before zipping them together.
-
-        Args:
-            data: Parsed CIK submissions JSON with ``filings.recent`` and optionally
-                ``filings.files`` overflow references.
-            filename: Source filename, used for failure registry entries and logging.
-            cik: CIK identifier for the company, used for failure registry entries.
-            zf: Open :class:`zipfile.ZipFile` from which overflow files are read.
-
-        Returns:
-            A ``zip`` iterator of ``(form, accession_number, primary_document,
-            filing_date)`` tuples, or ``None`` if the data is missing or inconsistent.
-        """
-        # Retrieve recent filings
-        forms = data.get("filings", {}).get("recent", {}).get("form", [])
-        accession_numbers = data.get("filings", {}).get("recent", {}).get("accessionNumber", [])
-        primary_documents = data.get("filings", {}).get("recent", {}).get("primaryDocument", [])
-        filing_dates = data.get("filings", {}).get("recent", {}).get("filingDate", [])
-
-        # Retrieve overflow filings
-        o_forms, o_accession_numbers, o_primary_documents, o_filing_dates = (
-            self._retrieve_overflow_filings(data, cik, zf)
-        )
-        forms.extend(o_forms)
-        accession_numbers.extend(o_accession_numbers)
-        primary_documents.extend(o_primary_documents)
-        filing_dates.extend(o_filing_dates)
-
-        if (
-            len({len(forms), len(accession_numbers), len(primary_documents), len(filing_dates)})
-            != 1
-        ):
-            self._record_failure(
-                (cik, filename),
-                FailureType.MISMATCHED_LENGTHS,
-                "error",
-                "Filename: %s has forms with mismatched data lengths.",
-                filename,
-                stat_keys=("failed_filings",),
-            )
-            return None
-
-        if not any([forms, accession_numbers, primary_documents, filing_dates]):
-            self._record_failure(
-                (cik, filename),
-                FailureType.NO_FORM_DATA,
-                "debug",
-                "Filename: %s has forms without data.",
-                filename,
-                stat_keys=("failed_filings",),
-            )
-            return None
-
-        return zip(forms, accession_numbers, primary_documents, filing_dates)
-
-    def _process_filings_zip(
-        self,
-        filings_zip: zip,
-        company_data: dict,
-        source_filename: str,
-    ) -> list[Filing]:
-        """Iterate a filings zip and collect 10-K Filing objects.
-
-        Args:
-            filings_zip: zip of (form, accession_number, primary_document, filing_date) tuples.
-            company_data: Dict with cik, name, location keys.
-            source_filename: Filename used for failure registry entries and debug logging.
-
-        Returns:
-            List of Filing objects for 10-K forms only.
-        """
-        filings = []
-        for form, accession_number, primary_document, filing_date in filings_zip:
-            if self.IS_10K.match(form) or self.IS_20F.match(form):
-                filings.append(
-                    self._create_filing(
-                        accession_number=accession_number,
-                        primary_document=primary_document,
-                        filing_date=filing_date,
-                        form=form,
-                        company_data=company_data,
-                    )
-                )
-                self.stats.increment("total_filing")
-
-            else:
-                self.logger.debug("Filename: %s skipping non-10K form: %s.", source_filename, form)
-
-        if not filings:
-            self.stats.increment("failed_filings")
-            self.failure_registry.add(
-                (company_data["cik"], source_filename), failure_type=FailureType.NO_10K_FILINGS
-            )
-
-        return filings
-
-    def _create_filing(
-        self,
-        accession_number: str,
-        primary_document: str,
-        filing_date: str,
-        form: str,
-        company_data: dict,
-    ) -> Filing:
-        """Create Filing object with form data.
-
-        Args:
-            accession_number: String taken from form data
-            primary_document: String document URL from form data
-            filing_date: String date of filing
-            form: String name of form
-            company_data: Dictionary with company data from SEC submissions JSON
-
-        Returns:
-            Filing object with form data
-        """
-        accession = accession_number.replace("-", "")
-        directory = f"{self.sec_client.SEC_URL}/{company_data['cik']}/{accession}/index.json"
-
-        if (
-            primary_document != ""
-            and primary_document.split(".")[-1].upper() in SUPPORTED_EXHIBIT_EXTENSIONS
-        ):
-            primary = (
-                f"{self.sec_client.SEC_URL}/{company_data['cik']}/{accession}/{primary_document}"
-            )
-        else:
-            primary = ""
-
-        return Filing(
-            cik=company_data["cik"],
-            filing_date=filing_date,
-            form_type=form,
-            accession_number=accession_number,
-            directory=directory,
-            primary_document=primary,
-            company_name=company_data["name"],
-            location=company_data["location"],
-            filename=company_data["filename"],
-        )
-
-    def _parse_file(self, zf: zipfile.ZipFile, filename: str) -> list[Filing]:
-        """Parse file contents and save as a row in the rows list.
-
-        Parses: cik, date, form, accession number, directory, and primary document
-
-        Args:
-            zf: Open ZipFile to read from.
-            filename: The filename to parse data from.
-
-        Returns:
-            List of Filing objects with form data
-        """
-        filings = []
-
-        # Overflow files have no company metadata; loaded below with primary file
-        if self.IS_OVERFLOW.search(filename):
-            return filings
-
-        if not (filename.startswith("CIK") and filename.endswith(".json")):
-            return filings
-
-        with zf.open(filename) as file:
-            data = json.load(file)
-
-        company_data = {
-            "cik": data.get("cik", ""),
-            "name": data.get("name", ""),
-            "location": data.get("stateOfIncorporation", ""),
-            "filename": filename,
-        }
-
-        # Skip files that had a permanent failure on a previous run
-        if (company_data["cik"], filename) in self.failure_registry:
-            self.logger.debug(
-                "Skipping permanent failure for filing: %s - %s", company_data["cik"], filename
-            )
-            self.stats.increment("skipped_filings")
-            return filings
-
-        # Process filings
-        filings_zip = self._zip_file_data(data, filename, company_data["cik"], zf)
-        if filings_zip:
-            filings.extend(self._process_filings_zip(filings_zip, company_data, filename))
-
-        return filings
-
-    def _filter_already_processed(self, filings: list[Filing]) -> list[Filing]:
-        """Drop filings already represented in the output parquet.
-
-        Reads the existing output parquet and removes any filing whose
-        ``(parent_cik, accession_number)`` key is already present. Returns
-        ``filings`` unchanged if no parquet exists yet.
-
-        Args:
-            filings: Filings returned by `load_input`.
-
-        Returns:
-            Filings that still need to be processed.
+            Set of accession numbers, or an empty set if the output file
+            does not exist yet.
         """
         try:
-            existing_df = pd.read_parquet(self.config.output_file)
+            output_df = pd.read_parquet(self.config.output_file, columns=["accession_number"])
         except FileNotFoundError:
-            return filings
+            return set()
+        return set(output_df["accession_number"].unique())
 
-        if "parent_cik" not in existing_df.columns or "accession_number" not in existing_df.columns:
-            return filings
+    def _fetch_company_meta(self, cik: str) -> CompanyMeta:
+        """Fetch per-CIK company metadata from the SEC submissions JSON.
 
-        existing_keys = set(zip(existing_df["parent_cik"], existing_df["accession_number"]))
-        unprocessed = [
-            f
-            for f in filings
-            if (f.cik, f.accession_number) not in existing_keys
-            and (f.cik, f.filename) not in self.failure_registry
-        ]
-        self.logger.info(
-            "Filter: %d filings loaded, %d skipped as already processed, %d remaining",
-            len(filings),
-            len(filings) - len(unprocessed),
-            len(unprocessed),
+        Cached per pipeline instance since ``load_input`` calls this once per
+        filing — companies with multiple filings in the date range would
+        otherwise trigger a redundant SEC request per extra filing. Safe
+        without a lock: ``load_input`` runs single-threaded, before the
+        extraction worker threads are started.
+
+        Args:
+            cik: SEC CIK number for the filer.
+
+        Returns:
+            CompanyMeta populated from the submissions endpoint, with blank
+            defaults for any fields missing from a successful response.
+
+        Raises:
+            CompanyMetaFetchError: If the SEC request failed (the response
+                contains an ``error`` key). A successful-but-sparse response is
+                not an error and yields blank defaults.
+        """
+        if cik in self._company_meta_cache:
+            return self._company_meta_cache[cik]
+
+        cik_10 = str(int(cik)).zfill(10)
+        url = f"{self.CIK_JSON_URL}/CIK{cik_10}.json"
+        response = self.sec_client.query_endpoint(sec_url=url)
+        if "error" in response:
+            # Request failed after the SEC client's retries. Raise instead of caching
+            # a blank CompanyMeta so the filing is skipped and retried on a later run.
+            raise CompanyMetaFetchError(cik, url)
+        data = response.get("data", {})
+        biz = data.get("addresses", {}).get("business", {})
+        company_meta = CompanyMeta(
+            state_of_incorporation=data.get("stateOfIncorporation", ""),
+            business_street1=biz.get("street1", ""),
+            business_street2=biz.get("street2", ""),
+            business_city=biz.get("city", ""),
+            business_state=biz.get("stateOrCountry", ""),
+            business_zip=biz.get("zipCode", ""),
+            business_country=biz.get("country", ""),
+            business_country_code=biz.get("countryCode", ""),
+            tickers=tuple(t or "" for t in data.get("tickers") or ()),
+            exchanges=tuple(e or "" for e in data.get("exchanges") or ()),
         )
-        return unprocessed
+        self._company_meta_cache[cik] = company_meta
+        return company_meta
+
+    @staticmethod
+    def _select_exhibit_documents(
+        scraped_filing: ScrapedFiling, exhibit_type: str
+    ) -> tuple[ScrapedDocument, ...]:
+        """Return the scraped documents matching the filing's exhibit type.
+
+        Args:
+            scraped_filing: Manifest whose documents are filtered.
+            exhibit_type: Exhibit number to match — ``"21"`` or ``"8"``.
+
+        Returns:
+            Documents whose ``type`` starts with ``ex21``/``ex8`` (after
+            stripping non-alphanumeric characters), in manifest order.
+        """
+        token = f"ex{exhibit_type}"  # ex21 or ex8
+        return tuple(
+            d
+            for d in scraped_filing.documents
+            if re.sub(r"[^0-9a-z]", "", d.type.lower()).startswith(token)
+        )
+
+    def _should_skip(self, filing: Filing, processed_accessions: set[str]) -> bool:
+        """Return True if the filing was already processed or previously failed.
+
+        Args:
+            filing: Filing being considered for processing.
+            processed_accessions: Accession numbers already present in the
+                output file.
+
+        Returns:
+            True if the filing's accession number is in
+            ``processed_accessions`` or already recorded in the failure
+            registry.
+        """
+        return (
+            filing.accession_number in processed_accessions
+            or (filing.cik, filing.accession_number) in self.failure_registry
+        )
 
     def load_input(self) -> list[Filing]:
         """Load input data from the SEC and return a list of filings.
 
+        Filings with no matching exhibit documents are recorded as
+        ``NO_EXHIBIT_FOUND`` failures and excluded from the returned list, so
+        the count reflects filings that actually have exhibit content to fetch.
+
         Returns:
             A list of Filing objects
         """
-        filings = []
-        with open_zip(self.config.input_file, headers=self.sec_client.sec_headers) as zf:
-            namelist = zf.namelist()
-            if self._INPUT_SAMPLE_SIZE:
-                namelist = namelist[: self._INPUT_SAMPLE_SIZE]
-            self.logger.info("Total # of files to process: %d", len(namelist))
+        processed_accessions = self._load_processed_accessions()
 
-            for filename in tqdm(namelist, desc="Retrieving filings"):
-                filings_for_file = self._parse_file(zf, filename)
-                if filings_for_file:
-                    filings.extend(filings_for_file)
-
-        self.logger.info(
-            "Located %d filings for %d forms",
-            len(filings),
-            len(namelist) - self.stats.skipped_filings,
+        scraped_filings = iter_filings_by_form_type(
+            form_types=TARGET_FORM_TYPES,
+            start_date=self.config.start_date,
+            end_date=self.config.end_date,
+            bucket=self.config.sec_bucket,
+            include_failures=True,
         )
-        self.logger.info("Skipped %d files", self.stats.skipped_filings)
 
-        return self._filter_already_processed(filings)
+        if self._INPUT_SAMPLE_SIZE:
+            scraped_filings = islice(scraped_filings, self._INPUT_SAMPLE_SIZE)
+
+        filings = []
+        for scraped_filing in scraped_filings:
+            self.stats.increment("total_filing")
+
+            try:
+                company_meta = self._fetch_company_meta(scraped_filing.cik)
+            except CompanyMetaFetchError:
+                # Retryable failure: not persisted to the registry, so the filing is
+                # neither written to output nor skipped on the next run.
+                self._record_failure(
+                    (scraped_filing.cik, scraped_filing.accession_number),
+                    FailureType.API_ERROR,
+                    "warning",
+                    "Failed to fetch company metadata for CIK %s - %s - will retry next run",
+                    scraped_filing.cik,
+                    scraped_filing.accession_number,
+                    stat_keys=("failed_filings",),
+                )
+                continue
+
+            filing = Filing(
+                cik=scraped_filing.cik,
+                filing_date=scraped_filing.filing_date,
+                form_type=scraped_filing.form_type,
+                accession_number=scraped_filing.accession_number,
+                primary_document=scraped_filing.index_url,
+                company_name=scraped_filing.company_name,
+                company=company_meta,
+            )
+            filing.exhibit_documents = self._select_exhibit_documents(
+                scraped_filing, filing.exhibit_type
+            )
+
+            if self._should_skip(filing, processed_accessions):
+                self.stats.increment("skipped_filings")
+                continue
+
+            if not filing.exhibit_documents:
+                self._record_failure(
+                    (filing.cik, filing.accession_number),
+                    FailureType.NO_EXHIBIT_FOUND,
+                    "warning",
+                    "No exhibit found for filing: %s - %s - %s (%s)",
+                    filing.cik,
+                    filing.accession_number,
+                    filing.filing_date,
+                    scraped_filing.index_url,
+                    stat_keys=("failed_filings",),
+                )
+                continue
+
+            filings.append(filing)
+
+        return filings
 
     def _record_failure(
         self,
@@ -491,7 +367,10 @@ class SubsidiaryPipeline(Pipeline):
         Args:
             key: Registry key tuple, typically ``(cik, filename)``.
             failure_type: Classified failure type.
-            log_level: Logger method name (``"warning"`` or ``"error"``).
+            log_level: Logger method name (``"warning"``, ``"error"``, or
+                ``"exception"``). ``"exception"`` behaves like ``"error"`` but
+                also attaches the current traceback — only valid when called
+                from within an active ``except`` block.
             message: ``%s``-style log message.
             *log_args: Arguments to substitute into ``message``.
             stat_keys: Stat field names to increment (default: ``("failed_subsidiaries",)``).
@@ -518,6 +397,8 @@ class SubsidiaryPipeline(Pipeline):
             num_subsidiaries: The number of subsidiaries extracted
             filing: The Filing object the subsidiaries were extracted for
         """
+        self.stats.increment("total_subsidiaries", num_subsidiaries)
+
         if num_chunks > 1:
             self.stats.increment("chunked_extractions")
 
@@ -529,7 +410,7 @@ class SubsidiaryPipeline(Pipeline):
 
         if num_subsidiaries == 0:
             self._record_failure(
-                (filing.cik, filing.filename),
+                (filing.cik, filing.accession_number),
                 FailureType.NO_SUBSIDIARIES,
                 "warning",
                 "No subsidiaries found for filing: %s - %s - %s",
@@ -539,7 +420,7 @@ class SubsidiaryPipeline(Pipeline):
                 stat_keys=("zero_subsidiaries",),
             )
 
-    def _extract_worker(self, work_queue: queue.Queue, results_queue: queue.Queue) -> None:
+    def _extract_worker(self, work_queue: queue.Queue, subsidiaries: list[Subsidiary]) -> None:
         """Worker thread that extracts subsidiaries from queued exhibit documents.
 
         Runs as a daemon thread, consuming ``(filing, exhibit_contents)`` tuples from
@@ -550,8 +431,8 @@ class SubsidiaryPipeline(Pipeline):
         Args:
             work_queue: Queue of ``(Filing, dict)`` tuples to process. Each dict has
                 ``"url"`` and ``"data"`` keys for the exhibit content.
-            results_queue: Queue to which extracted ``list[Subsidiary]`` results are
-                posted.
+            subsidiaries: Shared list, guarded by ``self._results_lock``, that
+                extracted ``Subsidiary`` results are appended to.
 
         Returns:
             None
@@ -559,254 +440,106 @@ class SubsidiaryPipeline(Pipeline):
         while True:
             filing, exhibit_contents = work_queue.get()
             try:
-                subsidiaries, ungrounded_name, ungrounded_location, num_chunks = (
+                subsidiaries_batch, ungrounded_name, ungrounded_location, num_chunks = (
                     self.extractor.extract(filing, exhibit_contents)
                 )
                 self._report_extraction(
                     num_chunks=num_chunks,
                     ungrounded_name=ungrounded_name,
                     ungrounded_location=ungrounded_location,
-                    num_subsidiaries=len(subsidiaries),
+                    num_subsidiaries=len(subsidiaries_batch),
                     filing=filing,
                 )
-                results_queue.put(subsidiaries)
+                with self._results_lock:
+                    subsidiaries.extend(subsidiaries_batch)
 
             except DocumentError as e:
                 self._record_failure(
-                    (filing.cik, filing.filename),
+                    (filing.cik, filing.accession_number),
                     FailureType.DOCUMENT_ERROR,
                     "error",
-                    "Document error for filing: %s - %s - %s: %s",
+                    "Document error for filing: %s - %s - %s: %s @ %s",
                     filing.cik,
                     filing.accession_number,
                     filing.filing_date,
                     e,
+                    exhibit_contents["url"],
                 )
 
             except ExtractionTimeoutError:
                 self._record_failure(
-                    (filing.cik, filing.filename),
+                    (filing.cik, filing.accession_number),
                     FailureType.TIMEOUT_ERROR,
                     "error",
-                    "Timeout extracting subsidiaries from filing: %s - %s - %s",
+                    "Timeout extracting subsidiaries from filing: %s - %s - %s @ %s",
                     filing.cik,
                     filing.accession_number,
                     filing.filing_date,
+                    exhibit_contents["url"],
                     stat_keys=("failed_subsidiaries", "timeout_subsidiaries"),
                 )
 
             except ExtractionTruncatedError as e:
                 self._record_failure(
-                    (filing.cik, filing.filename),
+                    (filing.cik, filing.accession_number),
                     FailureType.TRUNCATED_ERROR,
                     "error",
-                    "Truncated extraction for filing: %s - %s - %s: %s",
+                    "Truncated extraction for filing: %s - %s - %s: %s @ %s",
                     filing.cik,
                     filing.accession_number,
                     filing.filing_date,
                     e,
+                    exhibit_contents["url"],
                     stat_keys=("failed_subsidiaries", "truncated_extractions"),
                 )
 
-            except Exception:
+            except Exception as e:
                 self._record_failure(
-                    (filing.cik, filing.filename),
+                    (filing.cik, filing.accession_number),
                     FailureType.EXTRACTION_FAILED,
-                    "error",
-                    "Error extracting subsidiaries from filing: %s - %s - %s",
+                    "exception",
+                    "Error extracting subsidiaries from filing: %s - %s - %s @ %s: %s",
                     filing.cik,
                     filing.accession_number,
                     filing.filing_date,
+                    exhibit_contents["url"],
+                    e,
                 )
 
             finally:
                 work_queue.task_done()
+                self.stats.increment("extracted_documents")
+                if self.stats.extracted_documents % self._LOG_EVERY == 0:
+                    self.logger.info(
+                        "Extracted %d / %d documents",
+                        self.stats.extracted_documents,
+                        self.stats.queued_documents,
+                    )
 
-    def _results_worker(
-        self,
-        results_queue: queue.Queue,
-        subsidiaries: list[Subsidiary],
-        extract_bar: tqdm | None = None,
-    ) -> None:
-        """Worker thread that collects extracted subsidiaries from the results queue.
-
-        Runs as a daemon thread, consuming ``list[Subsidiary]`` batches from
-        ``results_queue`` and appending them to the shared ``subsidiaries`` list.
-        Optionally advances a tqdm progress bar on each batch completion.
+    def _extract_pdf_text(self, raw_content: bytes, doc_url: str, filing: Filing) -> str:
+        """Extract plain text from a PDF exhibit using pdfplumber.
 
         Args:
-            results_queue: Queue of ``list[Subsidiary]`` batches produced by
-                :meth:`_extract_worker`.
-            subsidiaries: Shared list to which extracted subsidiaries are appended.
-                Must be safe for single-threaded append (only this worker writes).
-            extract_bar: Optional tqdm progress bar incremented by one for each
-                completed extraction task.
+            raw_content: Raw PDF bytes fetched from S3.
+            doc_url: Original SEC URL of the PDF, used for failure logging.
+            filing: Filing the PDF belongs to, used for the failure registry key.
 
         Returns:
-            None
+            Extracted text, or an empty string if the PDF could not be parsed.
         """
-        while True:
-            result = results_queue.get()
-            subsidiaries.extend(result)
-            self.stats.increment("total_subsidiaries", len(result))
-
-            if extract_bar is not None:
-                extract_bar.update(1)
-
-            results_queue.task_done()
-
-    def _fetch_directory(self, filing: Filing) -> list[dict]:
-        """Fetch directory data from the SEC.
-
-        Args:
-            filing: Filing object to fetch directory data from
-
-        Returns:
-            Directory response items
-        """
-        directory_response = self.sec_client.query_endpoint(filing.directory)
-        if "directory" not in directory_response.get("data", {}).keys():
+        text = ""
+        try:
+            with pdfplumber.open(io.BytesIO(raw_content)) as pdf:
+                text = "\n\n".join(page.extract_text() or "" for page in pdf.pages)
+        except Exception:
             self._record_failure(
-                (filing.cik, filing.filename),
-                FailureType.NO_FILING_DIRECTORY,
-                "error",
-                "Filing: %s - %s - %s does not have a directory listing.",
-                filing.cik,
-                filing.accession_number,
-                filing.filing_date,
-            )
-            return []
-        return directory_response.get("data", {}).get("directory", {}).get("item", [])
-
-    def _fetch_pdf_content(self, filing: Filing, item: dict, sec_url: str) -> dict:
-        """Fetch PDF content from the SEC.
-
-        Args:
-            filing: Filing object to fetch PDF content from
-            item: Item object to fetch PDF content from
-            sec_url: URL of the PDF file
-
-        Returns:
-            Dict with 'url' and 'data' keys
-        """
-        self.logger.warning("PDF exhibit found: %s / %s", filing.cik, item["name"])
-        item_response = self.sec_client.query_endpoint(sec_url=sec_url, return_bytes=True)
-        exhibit_content = {}
-        if item_response.get("data"):
-            try:
-                with pdfplumber.open(io.BytesIO(item_response["data"])) as pdf:
-                    text = "\n\n".join(page.extract_text() or "" for page in pdf.pages)
-                exhibit_content = {"url": sec_url, "data": text}
-            except Exception:
-                self._record_failure(
-                    (filing.cik, filing.filename),
-                    FailureType.NO_EXHIBIT_CONTENT,
-                    "error",
-                    "Failed to extract PDF content: %s",
-                    sec_url,
-                )
-        return exhibit_content
-
-    def _fetch_html_content(self, name: str, filing: Filing, sec_url: str) -> dict:
-        """Fetch HTM/HTML content from the SEC and convert it to plain text.
-
-        Mirrors ``_fetch_pdf_content``: fetches the document and pre-processes
-        it (HTML → text) so the extractor works on the same string it hands to
-        the model and uses for grounding.
-
-        Args:
-            name: Name of the item
-            filing: Filing object to fetch HTML content from
-            sec_url: URL of the HTML file
-
-        Returns:
-            Dict with ``"url"`` and ``"data"`` (plain text) keys.
-        """
-        item_response = self.sec_client.query_endpoint(sec_url=sec_url, return_json=False)
-        if item_response.get("data"):
-            exhibit_content = {"url": sec_url, "data": html_to_text(item_response["data"])}
-        else:
-            exhibit_content = {}
-            self._record_failure(
-                (filing.cik, filing.filename),
+                (filing.cik, filing.accession_number),
                 FailureType.NO_EXHIBIT_CONTENT,
                 "error",
-                "Exhibit %s - %s - %s does not have content.",
-                name,
-                filing.cik,
-                filing.accession_number,
+                "Failed to extract PDF content: %s",
+                doc_url,
             )
-        return exhibit_content
-
-    def _fetch_other_content(self, name: str, filing: Filing, sec_url: str) -> dict:
-        """Fetch plain-text exhibit content from the SEC.
-
-        Args:
-            name: Name of the item
-            filing: Filing object to fetch other content from
-            sec_url: URL of the other content
-
-        Returns:
-            Dict with 'url' and 'data' keys
-        """
-        item_response = self.sec_client.query_endpoint(sec_url=sec_url, return_json=False)
-        if item_response.get("data"):
-            exhibit_content = {"url": sec_url, "data": item_response["data"]}
-        else:
-            exhibit_content = {}
-            self._record_failure(
-                (filing.cik, filing.filename),
-                FailureType.NO_EXHIBIT_CONTENT,
-                "error",
-                "Exhibit %s - %s - %s does not have content.",
-                name,
-                filing.cik,
-                filing.accession_number,
-            )
-        return exhibit_content
-
-    def _fetch_exhibit_content(self, filing: Filing, item: dict) -> dict:
-        """Fetch exhibit content from the SEC.
-
-        Supports HTM, HTML, TXT, and PDF files. PDFs are extracted via pdfplumber.
-        Unsupported file types are skipped. PDF instances are logged as warnings
-        since they are rare and may require manual review.
-
-        Args:
-            filing: Filing object to fetch exhibit content from
-            item: Item object to fetch exhibit content from
-
-        Returns:
-            Dict with 'url' and 'data' keys, or empty dict if not an exhibit 21 file
-            or the file type is unsupported.
-        """
-        name = item["name"].upper()
-        accession = filing.accession_number.replace("-", "")
-
-        num = filing.exhibit_type
-        num_re = self.TWENTYONE if num == "21" else self.EIGHT
-
-        if not (
-            (self.EX.search(name) and (name.startswith(num) or num_re.search(name)))
-            or "SUB" in name
-        ):
-            return {}
-
-        ext = item["name"].rsplit(".", 1)[-1].upper() if "." in item["name"] else ""
-        if ext not in SUPPORTED_EXHIBIT_EXTENSIONS:
-            self.logger.warning("Unsupported exhibit extension: %s", ext)
-            return {}
-
-        sec_url = f"{self.sec_client.SEC_URL}/{filing.cik}/{accession}/{item['name']}"
-        self.stats.increment(f"{ext.lower()}_exhibits")
-        if ext == "PDF":
-            exhibit_content = self._fetch_pdf_content(filing, item, sec_url)
-        elif ext in ("HTM", "HTML"):
-            exhibit_content = self._fetch_html_content(name, filing, sec_url)
-        else:
-            exhibit_content = self._fetch_other_content(name, filing, sec_url)
-
-        return exhibit_content
+        return text
 
     def _fetch_exhibit(self, filing: Filing) -> list[dict]:
         """Fetch exhibit data from the SEC.
@@ -817,20 +550,80 @@ class SubsidiaryPipeline(Pipeline):
         Returns:
             List of dicts with 'url' and 'data' keys
         """
-        directory_items = self._fetch_directory(filing)
         exhibit_content = []
-        for item in directory_items:
-            exhibits = self._fetch_exhibit_content(filing, item)
-            if exhibits:
-                exhibit_content.append(exhibits)
+        for doc in filing.exhibit_documents:
+            if not doc.s3_key:
+                continue
+
+            try:
+                raw_exhibit = load_content(doc.s3_key)
+            except Exception as e:
+                self._record_failure(
+                    (filing.cik, filing.accession_number),
+                    FailureType.NO_EXHIBIT_CONTENT,
+                    "error",
+                    "Failed to fetch exhibit %s - %s - %s from S3 (%s): %s",
+                    doc.filename,
+                    filing.cik,
+                    filing.accession_number,
+                    doc.s3_key,
+                    e,
+                )
+                continue
+
+            if not raw_exhibit:
+                self._record_failure(
+                    (filing.cik, filing.accession_number),
+                    FailureType.NO_EXHIBIT_CONTENT,
+                    "error",
+                    "Exhibit %s - %s - %s does not have content (%s).",
+                    doc.filename,
+                    filing.cik,
+                    filing.accession_number,
+                    doc.s3_key,
+                )
+                continue
+
+            ext = doc.filename.rsplit(".", 1)[-1].upper() if "." in doc.filename else ""
+            if ext in ("HTM", "HTML", "TXT", "PDF"):
+                self.stats.increment(f"{ext.lower()}_exhibits")
+
+            if ext == "PDF":
+                text = self._extract_pdf_text(raw_exhibit, doc.url, filing)
+            elif ext in ("HTM", "HTML"):
+                text = html_to_text(raw_exhibit.decode("utf-8", errors="replace"))
+            else:
+                text = raw_exhibit.decode("utf-8", errors="replace")
+
+            if not text.strip():
+                # Don't enqueue empty text - it would burn an OpenAI call downstream.
+                # PDF parse failures are already recorded inside _extract_pdf_text;
+                # record the other empty cases (e.g. HTML that renders to nothing).
+                if ext != "PDF":
+                    self._record_failure(
+                        (filing.cik, filing.accession_number),
+                        FailureType.NO_EXHIBIT_CONTENT,
+                        "warning",
+                        "Exhibit %s - %s - %s produced empty text (%s).",
+                        doc.filename,
+                        filing.cik,
+                        filing.accession_number,
+                        doc.s3_key,
+                    )
+                continue
+
+            exhibit_content.append({"url": doc.url, "data": text})
+
         return exhibit_content
 
     def process(self, input_list: list[Filing]) -> list[Subsidiary]:
         """Fetch exhibit content and extract subsidiaries from each filing.
 
-        Exhibit fetching (SEC HTTP calls) runs on the main thread; extraction is
-        parallelised across :attr:`~PipelineConfig.num_workers` daemon threads.
-        Progress is reported via two tqdm bars (fetching and extraction).
+        Exhibit fetching runs on the main thread; extraction is parallelised
+        across :attr:`~PipelineConfig.num_workers` daemon threads. Progress is
+        logged periodically (every :attr:`_LOG_EVERY` documents) rather than
+        via a live progress bar, since bars don't render correctly in
+        aggregated cloud logs.
 
         Args:
             input_list: List of :class:`Filing` objects returned by
@@ -840,55 +633,31 @@ class SubsidiaryPipeline(Pipeline):
             Deduplicated list of :class:`Subsidiary` objects extracted across all
             filings.
         """
-        self.logger.info("Located %d filings with exhibits to process", len(input_list))
-        # Queues to store exhibit data and subsidiary data
         work_queue = queue.Queue(maxsize=self.config.num_workers * 2)
-        result_queue = queue.Queue()
         subsidiaries = []
 
-        with (
-            tqdm(
-                total=len(input_list), desc="Fetching exhibits", position=0, leave=True
-            ) as fetch_bar,
-            tqdm(total=0, desc="Extracting subsidiaries", position=1, leave=True) as extract_bar,
-        ):
-            # Start extract and results workers
-            extract_workers = [
-                threading.Thread(
-                    target=self._extract_worker,
-                    args=(work_queue, result_queue),
-                    daemon=True,
-                    name=f"extract-worker-{i}",
-                )
-                for i in range(self.config.num_workers)
-            ]
-            for worker in extract_workers:
-                worker.start()
-
-            results_worker = threading.Thread(
-                target=self._results_worker,
-                args=(result_queue, subsidiaries, extract_bar),
+        # Start extract and results workers
+        extract_workers = [
+            threading.Thread(
+                target=self._extract_worker,
+                args=(work_queue, subsidiaries),
                 daemon=True,
-                name="results-worker",
+                name=f"extract-worker-{i}",
             )
-            results_worker.start()
+            for i in range(self.config.num_workers)
+        ]
+        for worker in extract_workers:
+            worker.start()
 
-            # SEC operations to fetch exhibit data — one task per document
-            for filing in input_list:
-                exhibit_contents = self._fetch_exhibit(filing)
-                if not exhibit_contents:
-                    self.failure_registry.add(
-                        (filing.cik, filing.filename), FailureType.NO_EXHIBIT_FOUND
-                    )
-                for exhibit_content in exhibit_contents:
-                    work_queue.put((filing, exhibit_content))
-                    extract_bar.total += 1
-                    extract_bar.refresh()
-                fetch_bar.update(1)
+        # SEC operations to fetch exhibit data — one task per document
+        for filing in input_list:
+            exhibit_contents = self._fetch_exhibit(filing)
+            for exhibit_content in exhibit_contents:
+                work_queue.put((filing, exhibit_content))
+                self.stats.increment("queued_documents")
 
-            # Wait for all extraction to complete
-            work_queue.join()
-            result_queue.join()
+        # Wait for all extraction to complete
+        work_queue.join()
 
         return subsidiaries
 
@@ -906,6 +675,14 @@ class SubsidiaryPipeline(Pipeline):
         Returns:
             None
         """
+        if not processed_list:
+            # pd.DataFrame([]) has zero columns (not just zero rows), so if no
+            # output file exists yet, the location/parent_state_of_incorporation
+            # normalization below would KeyError on a columnless frame. There's
+            # nothing new to merge or normalize either way, so skip entirely.
+            self.logger.info("No new subsidiaries extracted; skipping save_output")
+            return
+
         # Save processed subsidiaries to a DataFrame
         subsidiaries_df = pd.DataFrame([dataclasses.asdict(s) for s in processed_list])
 
@@ -932,8 +709,10 @@ class SubsidiaryPipeline(Pipeline):
         combined_subsidiaries_df["location"] = (
             combined_subsidiaries_df["location"].fillna("").map(normalize_subsidiary_location)
         )
-        combined_subsidiaries_df["parent_location"] = (
-            combined_subsidiaries_df["parent_location"].fillna("").map(normalize_parent_location)
+        combined_subsidiaries_df["parent_state_of_incorporation"] = (
+            combined_subsidiaries_df["parent_state_of_incorporation"]
+            .fillna("")
+            .map(normalize_parent_location)
         )
 
         # Drop duplicate rows keyed on (parent_cik, accession_number, name)

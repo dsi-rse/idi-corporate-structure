@@ -1,13 +1,34 @@
 """Data types for the corporate structure pipeline."""
 
 # Standard application imports
+import datetime
 import pathlib
 import re
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+# Third party applications
+from idi_ftm2j_shared.sec import ScrapedDocument
 
 _REMOTE_SCHEMES = ("s3://", "https://", "http://", "gs://")
 SUPPORTED_EXHIBIT_EXTENSIONS = frozenset({"HTM", "HTML", "TXT", "PDF"})
+
+# Single source of truth for which filings carry a subsidiaries exhibit
+# (Exhibit 21 domestic / Exhibit 8 foreign)
+TARGET_FORM_TYPES = [
+    # Domestic — Exhibit 21
+    "10-K",
+    "10-K/A",
+    "10-KT",
+    "10-KT/A",
+    # Foreign — Exhibit 8
+    "20-F",
+    "20-F/A",
+    "20FR12B",
+    "20FR12B/A",
+    "20FR12G",
+    "20FR12G/A",
+]
 
 
 def _is_local(path: str) -> bool:
@@ -27,6 +48,26 @@ def _is_local(path: str) -> bool:
     return not path.startswith(_REMOTE_SCHEMES)
 
 
+@dataclass(frozen=True)
+class CompanyMeta:
+    """Per-CIK company metadata from the SEC submissions JSON.
+
+    Fetched once per CIK and shared across all of that company's filings.
+    Business address only — mailing address adds little for entity matching.
+    """
+
+    state_of_incorporation: str = ""
+    business_street1: str = ""
+    business_street2: str = ""
+    business_city: str = ""
+    business_state: str = ""  # addresses.business.stateOrCountry — "CA" or a country code
+    business_zip: str = ""
+    business_country: str = ""
+    business_country_code: str = ""
+    tickers: tuple[str, ...] = ()  # ("POWW",)
+    exchanges: tuple[str, ...] = ()  # ("Nasdaq",)
+
+
 @dataclass
 class Filing:
     """Represents a single SEC 10-K filing with its metadata and document URLs."""
@@ -35,11 +76,10 @@ class Filing:
     filing_date: str
     form_type: str
     accession_number: str
-    directory: str
     primary_document: str
     company_name: str = ""
-    location: str = ""
-    filename: str = ""
+    company: CompanyMeta = field(default_factory=CompanyMeta)
+    exhibit_documents: tuple[ScrapedDocument, ...] = ()  # EX-21/EX-8
 
     @property
     def exhibit_type(self) -> str:
@@ -54,9 +94,11 @@ class Filing:
 class PipelineConfig:
     """Configuration for the subsidiary pipeline."""
 
-    input_file: str
     failure_file: str
     output_file: str
+    start_date: datetime.date
+    end_date: datetime.date
+    sec_bucket: str
     openai_api_key: str = ""
     failure_flush_every: int = 50
     rate_limit: float = 0.2
@@ -64,8 +106,6 @@ class PipelineConfig:
 
     def __post_init__(self) -> None:
         """Validate existence of local files."""
-        if _is_local(self.input_file) and not pathlib.Path(self.input_file).exists():
-            raise FileNotFoundError(f"Input file not found: {self.input_file}")
         if _is_local(self.failure_file) and not pathlib.Path(self.failure_file).parent.exists():
             pathlib.Path(self.failure_file).parent.mkdir(parents=True, exist_ok=True)
         if _is_local(self.output_file) and not pathlib.Path(self.output_file).parent.exists():
@@ -92,6 +132,8 @@ class PipelineStats:
     html_exhibits: int = 0
     txt_exhibits: int = 0
     pdf_exhibits: int = 0
+    queued_documents: int = 0
+    extracted_documents: int = 0
 
     def __post_init__(self) -> None:
         """Initialize the pipeline stats."""
@@ -121,5 +163,14 @@ class Subsidiary:
     name: str
     location: str
     parent_name: str = ""
-    parent_location: str = ""
+    parent_state_of_incorporation: str = ""
+    parent_business_street1: str = ""
+    parent_business_street2: str = ""
+    parent_business_city: str = ""
+    parent_business_state: str = ""
+    parent_business_zip: str = ""
+    parent_business_country: str = ""
+    parent_business_country_code: str = ""
+    parent_tickers: str = ""
+    parent_exchanges: str = ""
     source_quote: str = ""

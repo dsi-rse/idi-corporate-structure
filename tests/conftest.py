@@ -1,6 +1,6 @@
 """Shared fixtures for the test suite."""
 
-import zipfile
+import datetime
 from unittest.mock import MagicMock
 
 import pytest
@@ -8,41 +8,9 @@ from idi_ftm2j_shared.api import SecClient
 
 from idi_corporate_structure.extractor import GptExtractor
 from idi_corporate_structure.pipeline import SubsidiaryPipeline
-from idi_corporate_structure.types import Filing, PipelineConfig
+from idi_corporate_structure.types import CompanyMeta, Filing, PipelineConfig
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
-
-
-def make_cik_json(
-    forms: list | None = None,
-    accession_numbers: list | None = None,
-    primary_documents: list | None = None,
-    filing_dates: list | None = None,
-    cik: str = "",
-) -> dict:
-    """Build a minimal CIK JSON payload matching the SEC submissions.zip format."""
-    payload: dict = {
-        "filings": {
-            "recent": {
-                "form": forms or [],
-                "accessionNumber": accession_numbers or [],
-                "primaryDocument": primary_documents or [],
-                "filingDate": filing_dates or [],
-            }
-        }
-    }
-    if cik:
-        payload["cik"] = cik
-    return payload
-
-
-def make_directory_response(items: list | None = None) -> dict:
-    """Build a minimal SEC index.json response."""
-    return {
-        "status_code": 200,
-        "url": "https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/index.json",
-        "data": {"directory": {"item": items or [], "name": "000032019324000123"}},
-    }
 
 
 def make_exhibit_response(
@@ -50,9 +18,8 @@ def make_exhibit_response(
         "<html><body>\nApple Operations LLC (Delaware)\nApple Europe Ltd (Ireland)\n</body></html>"
     ),
 ) -> dict:
-    """Build a minimal SEC exhibit HTTP response dict."""
+    """Build a minimal exhibit document dict as passed to GptExtractor.extract()."""
     return {
-        "status_code": 200,
         "url": "https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/ex21.htm",
         "data": content,
     }
@@ -69,8 +36,9 @@ def sample_20f_filing() -> Filing:
         filing_date="2025-07-30",
         form_type="20-F",
         accession_number="0001628280-25-036727",
-        directory="https://www.sec.gov/Archives/edgar/data/1913847/000162828025036727/index.json",
-        primary_document="",
+        primary_document=(
+            "https://www.sec.gov/Archives/edgar/data/1913847/000162828025036727/index.htm"
+        ),
         company_name="Coincheck Group",
     )
 
@@ -83,10 +51,12 @@ def sample_filing() -> Filing:
         filing_date="2024-09-28",
         form_type="10-K",
         accession_number="0000320193-24-000123",
-        directory="https://www.sec.gov/Archives/edgar/data/0000320193/000032019324000123/index.json",
-        primary_document="https://www.sec.gov/Archives/edgar/data/0000320193/000032019324000123/aapl-20240928.htm",
+        primary_document=(
+            "https://www.sec.gov/Archives/edgar/data/0000320193/000032019324000123"
+            "/aapl-20240928.htm"
+        ),
         company_name="APPLE INC",
-        location="CA",
+        company=CompanyMeta(state_of_incorporation="CA"),
     )
 
 
@@ -110,15 +80,13 @@ def mock_extractor() -> MagicMock:
 
 @pytest.fixture
 def pipeline(tmp_path, mock_sec_client, mock_extractor) -> SubsidiaryPipeline:
-    """A SubsidiaryPipeline wired with a temp zip, temp failure file, and mocked dependencies."""
-    input_zip = tmp_path / "submissions.zip"
-    with zipfile.ZipFile(input_zip, "w"):
-        pass
-
+    """A SubsidiaryPipeline wired with a temp failure/output path and mocked dependencies."""
     config = PipelineConfig(
-        input_file=str(input_zip),
         failure_file=str(tmp_path / "failures.json"),
         output_file=str(tmp_path / "subsidiaries.parquet"),
+        start_date=datetime.date(2024, 1, 1),
+        end_date=datetime.date(2024, 1, 2),
+        sec_bucket="test-bucket",
         rate_limit=0.0,
         num_workers=2,
         failure_flush_every=100,

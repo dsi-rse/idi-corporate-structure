@@ -36,6 +36,7 @@ _BLOCK_TAGS = frozenset(
     }
 )
 _CELL_TAGS = frozenset({"td", "th"})
+_ROW_STRUCTURE_TAGS = frozenset({"table", "tr"})
 _INLINE_WS_RE = re.compile(r"[ \t\f\v]+")
 _MULTINEWLINE_RE = re.compile(r"\n{3,}")
 
@@ -46,6 +47,7 @@ _CHUNK_OVERLAP_CHARS = 400
 
 _INVISIBLE_CHARS_RE = re.compile(r"[\u200b\u200c\u200d\ufeff]")
 _PUNCT_RE = re.compile(r"[^\w]+")
+_TRAILING_FOOTNOTE_RE = re.compile(r"\s*\(\d+\)\s*$")
 
 
 class DocumentError(Exception):
@@ -107,7 +109,9 @@ class GptExtractor(Extractor):
         self._model = model or self._DEFAULT_MODEL
         self._logger = get_logger(type(self).__name__)
 
-    def _extract_with_chunking(self, doc_text: str, company_name: str) -> tuple[list[dict], int]:
+    def _extract_with_chunking(
+        self, doc_text: str, company_name: str, doc_url: str
+    ) -> tuple[list[dict], int]:
         """Run extraction one-shot, falling back to chunked extraction if needed.
 
         Two triggers cause chunking:
@@ -120,22 +124,30 @@ class GptExtractor(Extractor):
         Args:
             doc_text: Full plain-text exhibit content.
             company_name: String name of the filing company
+            doc_url: SEC URL of the exhibit, included in chunk-yield log lines
+                so a low-yield warning can be traced back to the source document.
 
         Returns:
             Tuple of (raw subsidiary dicts from the model, num chunks used).
             ``num_chunks == 1`` means no chunking was performed.
         """
         if len(doc_text) > _CHUNK_THRESHOLD_CHARS:
-            return self._summarize_chunks(doc_text, company_name)
+            return self._summarize_chunks(doc_text, company_name, doc_url)
 
         try:
             return self._summarize(doc_text).get("subsidiaries", []), 1
         except ExtractionTruncatedError:
             self._logger.info("One-shot extraction truncated; retrying with chunking")
-            return self._summarize_chunks(doc_text, company_name)
+            return self._summarize_chunks(doc_text, company_name, doc_url)
 
     def _log_chunk(
-        self, chunk: str, chunk_subs: list[dict], company_name: str, i: int, num_chunks: int
+        self,
+        chunk: str,
+        chunk_subs: list[dict],
+        company_name: str,
+        doc_url: str,
+        i: int,
+        num_chunks: int,
     ) -> None:
         """Log the chunking process.
 
@@ -143,6 +155,7 @@ class GptExtractor(Extractor):
             chunk: The chunk of text to log.
             chunk_subs: The subsidiaries returned by the model for the chunk.
             company_name: The name of the filing company.
+            doc_url: SEC URL of the exhibit the chunk was taken from.
             i: The index of the chunk.
             num_chunks: The number of chunks.
         """
@@ -151,21 +164,25 @@ class GptExtractor(Extractor):
         yield_ratio = output_rows / input_rows if input_rows else 0.0
         log = self._logger.warning if yield_ratio < self._LOW_YIELD_RATIO else self._logger.info
         log(
-            "%s chunk %d/%d: %d input rows → %d extracted (yield=%.2f)",
+            "%s chunk %d/%d: %d input rows → %d extracted (yield=%.2f) @ %s",
             company_name,
             i,
             num_chunks,
             input_rows,
             output_rows,
             yield_ratio,
+            doc_url,
         )
 
-    def _summarize_chunks(self, doc_text: str, company_name: str) -> tuple[list[dict], int]:
+    def _summarize_chunks(
+        self, doc_text: str, company_name: str, doc_url: str
+    ) -> tuple[list[dict], int]:
         """Chunk ``doc_text`` and run a separate summarize call per chunk.
 
         Args:
             doc_text: Full plain-text exhibit content
             company_name: String name of the filing company
+            doc_url: SEC URL of the exhibit, included in log lines for traceability.
 
         Returns:
             Tuple of (concatenated raw subsidiaries from all chunks, chunk count)
@@ -177,7 +194,9 @@ class GptExtractor(Extractor):
         chunks = _chunk_document(
             doc_text, _CHUNK_MAX_CHARS, _CHUNK_OVERLAP_CHARS, _CHUNK_MAX_ENTRIES
         )
-        self._logger.info("%s chunked extraction: %d chunks", company_name, len(chunks))
+        self._logger.info(
+            "%s chunked extraction: %d chunks @ %s", company_name, len(chunks), doc_url
+        )
 
         all_subs: list[dict] = []
         for i, chunk in enumerate(chunks, 1):
@@ -185,12 +204,15 @@ class GptExtractor(Extractor):
                 result = self._summarize(chunk)
             except ExtractionTruncatedError:
                 self._logger.error(
-                    "Chunk %d/%d truncated — chunk size may be too large", i, len(chunks)
+                    "Chunk %d/%d truncated — chunk size may be too large @ %s",
+                    i,
+                    len(chunks),
+                    doc_url,
                 )
                 raise
 
             chunk_subs = result.get("subsidiaries", [])
-            self._log_chunk(chunk, chunk_subs, company_name, i, len(chunks))
+            self._log_chunk(chunk, chunk_subs, company_name, doc_url, i, len(chunks))
             all_subs.extend(chunk_subs)
 
         return all_subs, len(chunks)
@@ -313,8 +335,21 @@ class GptExtractor(Extractor):
         """
         ungrounded_location = 0
         if location:
-            name_pos = doc_text_normalized.find(_normalize(name))
-            name_len = len(_normalize(name))
+            normalized_name = _normalize(name)
+            name_pos = doc_text_normalized.find(normalized_name)
+            if name_pos == -1:
+                # Name only matched via the compact (punctuation-stripped) fallback
+                # - using -1 as-is would silently check the start of the
+                # document instead. Skip rather than report a bogus result.
+                self._logger.debug(
+                    "Skipping location-proximity check for %r (grounded via compact "
+                    "fallback, no exact position) @ %s",
+                    name,
+                    doc_url,
+                )
+                return ungrounded_location
+
+            name_len = len(normalized_name)
             window = doc_text_normalized[max(0, name_pos - 200) : name_pos + name_len + 200]
 
             if _normalize(location) not in window:
@@ -396,7 +431,9 @@ class GptExtractor(Extractor):
             RuntimeError: If the OpenAI API returns any other error.
         """
         # Summarize the subsidiaries in the exhibit
-        raw_subs, num_chunks = self._extract_with_chunking(document["data"], filing.company_name)
+        raw_subs, num_chunks = self._extract_with_chunking(
+            document["data"], filing.company_name, document["url"]
+        )
 
         # Dedupe by normalized name
         deduped = dedup_by_name(raw_subs=raw_subs)
@@ -411,7 +448,16 @@ class GptExtractor(Extractor):
             Subsidiary(
                 parent_cik=filing.cik,
                 parent_name=filing.company_name,
-                parent_location=filing.location,
+                parent_state_of_incorporation=filing.company.state_of_incorporation,
+                parent_business_street1=filing.company.business_street1,
+                parent_business_street2=filing.company.business_street2,
+                parent_business_city=filing.company.business_city,
+                parent_business_state=filing.company.business_state,
+                parent_business_zip=filing.company.business_zip,
+                parent_business_country=filing.company.business_country,
+                parent_business_country_code=filing.company.business_country_code,
+                parent_tickers=",".join(filing.company.tickers),
+                parent_exchanges=",".join(filing.company.exchanges),
                 filing_date=filing.filing_date,
                 form_type=filing.form_type,
                 exhibit_type=filing.exhibit_type,
@@ -450,8 +496,16 @@ def html_to_text(raw_html: str) -> str:
             tag.insert_before(" ")
             tag.insert_after(" ")
         elif tag.name in _BLOCK_TAGS:
-            tag.insert_before("\n")
-            tag.insert_after("\n")
+            # Filing software commonly wraps each cell's text in its own block
+            # tag purely for styling (e.g. <td><div>...</div></td>).
+            # Only "table"/"tr" force a break even when nested in a cell, so a
+            # genuinely nested table still gets one.
+            if tag.name not in _ROW_STRUCTURE_TAGS and tag.find_parent(_CELL_TAGS) is not None:
+                tag.insert_before(" ")
+                tag.insert_after(" ")
+            else:
+                tag.insert_before("\n")
+                tag.insert_after("\n")
 
     text = _html.unescape(soup.get_text())
 
@@ -642,6 +696,13 @@ def dedup_by_name(raw_subs: list[dict]) -> list[dict]:
 def _clean_name(name: str) -> str:
     """Clean up subsidiary name.
 
+    Names are kept verbatim through extraction and grounding (see the system
+    prompt) so exhibit footnote markers like the trailing ``(1)`` in
+    "Freedom Bank Kazakhstan JSC, Kazakhstan(1)" survive into the model's
+    output. Grounding has already run by the time this is called, so it's
+    safe to strip that footnote noise here — mirrors the trailing-footnote
+    strip already applied to ``location`` in normalization.py.
+
     Args:
         name: String extracted for subsidiary name
 
@@ -651,4 +712,5 @@ def _clean_name(name: str) -> str:
     name = _html.unescape(name)
     name = _INVISIBLE_CHARS_RE.sub("", name)
     name = name.replace("\xa0", " ")
-    return " ".join(name.split())
+    name = " ".join(name.split())
+    return _TRAILING_FOOTNOTE_RE.sub("", name).strip()

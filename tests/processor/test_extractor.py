@@ -701,17 +701,10 @@ class TestPerChunkYieldLogging:
             )
         )
 
-    def _make_extractor_with_capturable_logs(self, mocker):
-        """Build a GptExtractor whose logger propagates to the root (so caplog sees it)."""
-        extractor = GptExtractor(openai_api_key="fake-key")
-        mocker.patch.object(extractor._logger, "propagate", True)
-        return extractor
-
-    def test_yield_log_emitted_per_chunk(self, sample_filing, mocker, caplog):
+    def test_yield_log_emitted_per_chunk(self, sample_filing, mocker):
         """One yield log line per chunk, at INFO level when yield is healthy."""
-        import logging
-
-        extractor = self._make_extractor_with_capturable_logs(mocker)
+        extractor = GptExtractor(openai_api_key="fake-key")
+        info_spy = mocker.spy(extractor._logger, "info")
         mocker.patch.object(
             extractor,
             "_summarize",
@@ -727,18 +720,16 @@ class TestPerChunkYieldLogging:
             },
         )
 
-        with caplog.at_level(logging.INFO, logger="idi_corporate_structure.extractor"):
-            _, _, _, num_chunks = extractor.extract(sample_filing, self._build_chunked_doc())
+        _, _, _, num_chunks = extractor.extract(sample_filing, self._build_chunked_doc())
 
-        yield_lines = [r for r in caplog.records if "input rows" in r.getMessage()]
-        assert len(yield_lines) == num_chunks
-        assert all("yield=" in r.getMessage() for r in yield_lines)
+        yield_calls = [c for c in info_spy.call_args_list if "input rows" in c.args[0]]
+        assert len(yield_calls) == num_chunks
+        assert all("yield=" in c.args[0] for c in yield_calls)
 
-    def test_low_yield_emits_warning(self, sample_filing, mocker, caplog):
+    def test_low_yield_emits_warning(self, sample_filing, mocker):
         """Chunk yield below _LOW_YIELD_RATIO is logged as a WARNING."""
-        import logging
-
-        extractor = self._make_extractor_with_capturable_logs(mocker)
+        extractor = GptExtractor(openai_api_key="fake-key")
+        warning_spy = mocker.spy(extractor._logger, "warning")
         mocker.patch.object(
             extractor,
             "_summarize",
@@ -753,19 +744,15 @@ class TestPerChunkYieldLogging:
             },
         )
 
-        with caplog.at_level(logging.WARNING, logger="idi_corporate_structure.extractor"):
-            extractor.extract(sample_filing, self._build_chunked_doc())
+        extractor.extract(sample_filing, self._build_chunked_doc())
 
-        warnings = [
-            r for r in caplog.records if r.levelname == "WARNING" and "input rows" in r.getMessage()
-        ]
-        assert warnings, "low-yield chunk should produce a WARNING-level yield log"
+        yield_warnings = [c for c in warning_spy.call_args_list if "input rows" in c.args[0]]
+        assert yield_warnings, "low-yield chunk should produce a WARNING-level yield log"
 
-    def test_healthy_yield_does_not_warn(self, sample_filing, mocker, caplog):
+    def test_healthy_yield_does_not_warn(self, sample_filing, mocker):
         """High-yield chunks do not emit WARNING-level yield logs."""
-        import logging
-
-        extractor = self._make_extractor_with_capturable_logs(mocker)
+        extractor = GptExtractor(openai_api_key="fake-key")
+        warning_spy = mocker.spy(extractor._logger, "warning")
 
         def echo(doc):
             rows = [p for p in doc.split("\n\n") if p.strip()]
@@ -782,13 +769,10 @@ class TestPerChunkYieldLogging:
 
         mocker.patch.object(extractor, "_summarize", side_effect=echo)
 
-        with caplog.at_level(logging.WARNING, logger="idi_corporate_structure.extractor"):
-            extractor.extract(sample_filing, self._build_chunked_doc())
+        extractor.extract(sample_filing, self._build_chunked_doc())
 
-        warnings = [
-            r for r in caplog.records if r.levelname == "WARNING" and "input rows" in r.getMessage()
-        ]
-        assert not warnings, "healthy-yield chunks should not warn"
+        yield_warnings = [c for c in warning_spy.call_args_list if "input rows" in c.args[0]]
+        assert not yield_warnings, "healthy-yield chunks should not warn"
 
 
 class TestJnjChunkingFixture:
@@ -1003,6 +987,33 @@ class TestCleanName:
         dirty = "ASM Services\xa0S.a\xa0r.l.\u200c"
         assert _clean_name(dirty) == "ASM Services S.a r.l."
 
+    def test_trailing_footnote_marker_stripped(self):
+        """A footnote ref appended straight onto a name must not leak into storage.
+
+        E.g. 'Freedom Bank Kazakhstan JSC, Kazakhstan(1)' \u2014 grounding has
+        already run by the time this cleanup applies, so it's safe to strip.
+        """
+        from idi_corporate_structure.extractor import _clean_name
+
+        assert (
+            _clean_name("Freedom Bank Kazakhstan JSC, Kazakhstan(1)")
+            == "Freedom Bank Kazakhstan JSC, Kazakhstan"
+        )
+
+    def test_trailing_footnote_marker_with_space_stripped(self):
+        from idi_corporate_structure.extractor import _clean_name
+
+        assert _clean_name("Example Corp (2)") == "Example Corp"
+
+    def test_parenthetical_not_at_end_preserved(self):
+        """A parenthetical that's part of the legal name must not be stripped.
+
+        Only a trailing footnote digit in parens should be, e.g. "(1)".
+        """
+        from idi_corporate_structure.extractor import _clean_name
+
+        assert _clean_name("U-Haul Co. (Canada) Ltd.") == "U-Haul Co. (Canada) Ltd."
+
 
 class TestCompactGroundingFallback:
     """Tests for _compact and the compact fallback in _is_name_in_document."""
@@ -1068,6 +1079,33 @@ class TestCompactGroundingFallback:
         call_args = mock_log_instance.debug.call_args[0]
         assert "compact fallback" in call_args[0]
 
+    def test_location_check_skipped_when_name_only_matched_via_compact_fallback(self, mocker):
+        """A name only grounded via the compact fallback has no exact doc position.
+
+        Its normalized form's ``.find()`` returns -1. The proximity window
+        used to be built from that -1 as if it were a real index — silently
+        checking the start of the document instead of near the name. It
+        should skip the check instead.
+        """
+        from idi_corporate_structure.extractor import GptExtractor, _normalize
+
+        extractor = GptExtractor(openai_api_key="fake-key")
+        debug_spy = mocker.spy(extractor._logger, "debug")
+        doc = "Johnson & Johnson (Singapore) HoldCo LLC, a Delaware corporation"
+
+        ungrounded = extractor._is_location_grounded(
+            name="Johnson & Johnson Singapore HoldCo LLC",  # only matches via compact fallback
+            location="Delaware",
+            doc_text_normalized=_normalize(doc),
+            doc_url="https://example.com",
+        )
+
+        assert ungrounded == 0
+        assert any(
+            "Skipping location-proximity check" in str(call.args[0])
+            for call in debug_spy.call_args_list
+        )
+
 
 class TestCleanNameWiredIntoExtract:
     """End-to-end tests verifying _clean_name runs on every stored Subsidiary.name."""
@@ -1108,6 +1146,33 @@ class TestCleanNameWiredIntoExtract:
         assert ungrounded == 0, "Compact fallback should have accepted the name"
         assert len(result) == 1
         assert result[0].name == model_name
+
+    def test_compact_fallback_name_does_not_corrupt_location_grounding_count(
+        self, sample_filing, mocker
+    ):
+        """A compact-fallback-only name must not corrupt the ungrounded_location count.
+
+        See test_location_check_skipped_when_name_only_matched_via_compact_fallback
+        for the bogus-window bug this guards against. It should stay 0.
+        """
+        extractor = GptExtractor(openai_api_key="fake-key")
+        doc_content = "Johnson & Johnson (Singapore) HoldCo LLC, a Delaware corporation"
+        model_name = "Johnson & Johnson Singapore HoldCo LLC"
+        mocker.patch.object(
+            extractor._openai_client,
+            "query_endpoint",
+            return_value=_make_openai_response(
+                [{"name": model_name, "location": "Delaware", "source_quote": model_name}]
+            ),
+        )
+
+        result, ungrounded_name, ungrounded_location, _ = extractor.extract(
+            sample_filing, make_exhibit_response(content=doc_content)
+        )
+
+        assert ungrounded_name == 0
+        assert ungrounded_location == 0
+        assert len(result) == 1
 
 
 class TestTakeOverlap:
