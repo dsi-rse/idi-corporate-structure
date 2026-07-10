@@ -910,6 +910,66 @@ class TestWindowedSubsequenceGrounding:
         )
 
 
+class TestIsNameGrounded:
+    """The pre-normalized grounding core shared across a document's names."""
+
+    def test_matches_each_grounding_tier_with_prenormalized_forms(self):
+        from idi_corporate_structure.extractor import (
+            _compact,
+            _is_name_grounded,
+            _normalize,
+        )
+
+        doc = "Apple Operations LLC (Delaware) — PT Telekomunikasi ​ Mobile selular"
+        doc_norm, doc_compact = _normalize(doc), _compact(doc)
+
+        assert _is_name_grounded("Apple Operations LLC", doc_norm, doc_compact)  # strict
+        assert _is_name_grounded("Apple Operations, LLC.", doc_norm, doc_compact)  # compact
+        assert _is_name_grounded("PT Telekomunikasi Selular", doc_norm, doc_compact)  # windowed
+        assert not _is_name_grounded("Ghost Corp", doc_norm, doc_compact)
+        assert not _is_name_grounded("", doc_norm, doc_compact)
+
+    def test_wrapper_matches_core(self):
+        """_is_name_in_document is a thin wrapper that agrees with _is_name_grounded."""
+        from idi_corporate_structure.extractor import (
+            _compact,
+            _is_name_grounded,
+            _is_name_in_document,
+            _normalize,
+        )
+
+        doc = "Johnson & Johnson (Singapore) HoldCo LLC (Delaware)"
+        name = "Johnson & Johnson Singapore HoldCo LLC"
+
+        assert _is_name_in_document(name, doc) == _is_name_grounded(
+            name, _normalize(doc), _compact(doc)
+        )
+
+    def test_document_not_renormalized_per_name(self, mocker):
+        """The document is normalized a constant number of times, not once per name."""
+        from idi_corporate_structure import extractor as ext_mod
+
+        extractor = GptExtractor(openai_api_key="fake-key")
+        normalize_spy = mocker.spy(ext_mod, "_normalize")
+        compact_spy = mocker.spy(ext_mod, "_compact")
+
+        document = make_exhibit_response(
+            content="Apple Operations LLC (Delaware)\n\nApple Europe Ltd (Ireland)"
+        )
+        doc_text = document["data"]
+        subs = [
+            {"name": "Apple Operations LLC", "location": "Delaware", "source_quote": ""}
+            for _ in range(5)
+        ]
+
+        extractor._locate_grounded_subsidiaries(subs, document)
+
+        # Were the document re-normalized per name, these would be ~5x higher. The doc
+        # is normalized once directly + once inside the single _compact(doc) call.
+        assert normalize_spy.call_args_list.count(mocker.call(doc_text)) <= 2
+        assert compact_spy.call_args_list.count(mocker.call(doc_text)) == 1
+
+
 class TestJnjChunkingFixture:
     """End-to-end chunking test against the real Johnson & Johnson Exhibit 21.
 

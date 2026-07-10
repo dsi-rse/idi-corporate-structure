@@ -500,11 +500,14 @@ class GptExtractor(Extractor):
 
         doc_text = document.get("data", "")
         doc_url = document.get("url", "")
+        # Normalize the document once and reuse across every name, rather than
+        # re-normalizing the whole exhibit per subsidiary.
         doc_text_normalized = _normalize(doc_text)
+        doc_text_compact = _compact(doc_text)
 
         for sub in subsidiaries:
             name = sub.get("name", "")
-            if not _is_name_in_document(name, doc_text):
+            if not _is_name_grounded(name, doc_text_normalized, doc_text_compact):
                 self._logger.warning("Dropped %r from %s (name not in document)", name, doc_url)
                 ungrounded_name += 1
                 continue
@@ -796,8 +799,8 @@ def _name_tokens_in_window(name: str, document_normalized: str) -> bool:
         start = first + 1
 
 
-def _is_name_in_document(name: str, document: str) -> bool:
-    """Check if a name appears in the document (the source of truth).
+def _is_name_grounded(name: str, document_normalized: str, document_compact: str) -> bool:
+    """Check if a name is grounded against pre-normalized document forms.
 
     Tries a strict normalized substring match first. If that fails, falls
     back to a compact (punctuation-stripped) match to catch cases where the
@@ -807,9 +810,14 @@ def _is_name_in_document(name: str, document: str) -> bool:
     in-order token match to recover names shattered across table columns by
     ``html_to_text`` linearization.
 
+    The document forms are passed in so the caller can compute them once per
+    exhibit and reuse them across every candidate name, rather than
+    re-normalizing the whole document for each subsidiary.
+
     Args:
         name: The name to check.
-        document: The document text to check for the name.
+        document_normalized: The document text after ``_normalize``.
+        document_compact: The document text after ``_compact``.
 
     Returns:
         True if the name is found via the strict, compact, or windowed match,
@@ -818,11 +826,10 @@ def _is_name_in_document(name: str, document: str) -> bool:
     if not name:
         return False
 
-    document_normalized = _normalize(document)
     if _normalize(name) in document_normalized:
         return True
 
-    if _compact(name) in _compact(document):
+    if _compact(name) in document_compact:
         get_logger(__name__).debug(
             "Name %r matched via compact fallback (model produced a slight variant)", name
         )
@@ -835,6 +842,23 @@ def _is_name_in_document(name: str, document: str) -> bool:
         return True
 
     return False
+
+
+def _is_name_in_document(name: str, document: str) -> bool:
+    """Check if a name appears in the document, normalizing the document inline.
+
+    Thin convenience wrapper over :func:`_is_name_grounded` for callers with a
+    single name to check (and the test suite). Hot loops over many names should
+    call :func:`_is_name_grounded` with document forms computed once.
+
+    Args:
+        name: The name to check.
+        document: The raw document text to check for the name.
+
+    Returns:
+        True if the name is found via the strict, compact, or windowed match.
+    """
+    return _is_name_grounded(name, _normalize(document), _compact(document))
 
 
 def _normalize(s: str) -> str:
