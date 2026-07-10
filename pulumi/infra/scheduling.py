@@ -94,14 +94,19 @@ def _container_override_input() -> str:
 
     Mirrors the command in the task definition so the schedule drives execution
     with the same arguments. All values resolve to plain strings at plan time.
+
+    ``--daily`` processes the most recent filings (default 7-day look-back) from
+    the SEC bucket's manifest; the OpenAI key and SEC User-Agent are supplied via
+    the task's environment (see ecs.py), not on the command line.
     """
     command = [
-        "--input-file",
-        ecs.input_file,
+        "--sec-bucket-prefix",
+        ecs.sec_bucket_prefix,
         "--output-file",
         ecs.output_file,
         "--failure-file",
         ecs.failure_file,
+        "--daily",
         "--rate-limit",
         ecs.rate_limit,
         "--num-workers",

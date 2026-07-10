@@ -1,6 +1,6 @@
 # Committed variable config for the prod stack.
 config:
-  idi:input_file: "<REQUIRED: bucket-relative key the orchestrator reads, e.g. corporate-structure/input/companies.csv>"
+  idi:sec_prefix: "sec"
   idi:sec_user_agent: "<REQUIRED: SEC EDGAR contact, e.g. 'IDI Clinic data@uchicago.edu'>"
   idi:cpu: "1024"
   idi:memory: "4096"

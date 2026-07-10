@@ -8,9 +8,17 @@ services:
     container_name: idi-corporate-structure-orchestrator
 
     environment:
+      # SEC data is read from S3, so AWS credentials are required (an instance
+      # role on EC2, or pass keys through locally).
       - AWS_REGION=${AWS_REGION:-us-east-2}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:?OPENAI_API_KEY is required}
-      - INPUT_FILE=${INPUT_FILE:-/data/input/submissions.zip}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4.1-nano}
+      # bucket-name/prefix where the sec-scraper wrote SEC data + manifest.parquet
+      - SEC_BUCKET_PREFIX=${SEC_BUCKET_PREFIX:?SEC_BUCKET_PREFIX is required (e.g. my-bucket/sec)}
+      - SEC_USER_AGENT=${SEC_USER_AGENT:?SEC_USER_AGENT is required (SEC EDGAR contact string)}
       - OUTPUT_FILE=${OUTPUT_FILE:-/data/output/subsidiaries.parquet}
       - FAILURE_FILE=${FAILURE_FILE:-/data/failures/failures.json}
       - RATE_LIMIT=${RATE_LIMIT:-0.2}
@@ -19,20 +27,23 @@ services:
       - INPUT_SAMPLE_SIZE=${INPUT_SAMPLE_SIZE:-0}
 
     volumes:
-      - ${INPUT_MOUNT_SOURCE:?INPUT_MOUNT_SOURCE is required (host directory containing the input file)}:/data/input:ro
       - ${OUTPUT_MOUNT_SOURCE:?OUTPUT_MOUNT_SOURCE is required (host directory for output files)}:/data/output
       - ${FAILURE_MOUNT_SOURCE:?FAILURE_MOUNT_SOURCE is required (host directory for failure files)}:/data/failures
       - ${LOG_DIR:?LOG_DIR is required (host directory for log files)}:/logs
 
     entrypoint: ["/bin/sh", "-c"]
+    # --daily mirrors the scheduled cloud run. OPENAI_API_KEY / OPENAI_MODEL /
+    # SEC_USER_AGENT are read from the environment above by the orchestrator, so
+    # they are not passed on the command line. For a specific range instead of
+    # --daily, run the module directly with --start-date/--end-date.
     command: >
-      "python -m idi_corporate_structure.processor.orchestrator
-      --input-file $${INPUT_FILE:-/data/input/submissions.zip}
-      --output-file $${OUTPUT_FILE:-/data/output/subsidiaries.parquet}
-      --failure-file $${FAILURE_FILE:-/data/failures/failures.json}
-      --openai-api-key ${OPENAI_API_KEY}
-      --rate-limit ${RATE_LIMIT:-0.2}
-      --num-workers ${NUM_WORKERS:-10}
+      "python -m idi_corporate_structure.orchestrator
+      --sec-bucket-prefix $${SEC_BUCKET_PREFIX}
+      --output-file $${OUTPUT_FILE}
+      --failure-file $${FAILURE_FILE}
+      --daily
+      --rate-limit $${RATE_LIMIT}
+      --num-workers $${NUM_WORKERS}
       2>&1 | tee /logs/orchestrator_$(date +%Y%m%d_%H%M%S).log"
 
     # Retry up to 3 times if the process exits with a non-zero code

@@ -1,29 +1,30 @@
 # IDI Corporate Structure Pipeline
 
-Automated pipeline for extracting subsidiary information from SEC 10-K filings (Exhibit 21) and building hierarchical corporate structure trees.
+Automated pipeline for extracting subsidiary information from SEC 10-K (Exhibit 21) and 20-F (Exhibit 8) filings and building hierarchical corporate structure trees.
 
 ## Pipeline Overview
 
-Each run performs three stages:
+This processor consumes SEC filing data already collected by the upstream **sec-scraper** (stored in S3), and performs three stages:
 
-1. **Collection** — parse `submissions.zip` from SEC EDGAR bulk data; extract all 10-K filing metadata (CIK, accession number, filing date, exhibit URLs); output `Filing` records
-2. **Retrieval** — fetch each filing's directory index from SEC EDGAR; locate and download Exhibit 21 (Subsidiaries of the Registrant)
-3. **Extraction** — pass exhibit content to `gpt-4.1-nano` using structured output to parse subsidiary names and incorporation locations. Each result includes a `source_quote`: a verbatim snippet from the exhibit that contains the subsidiary's name. Rows whose quote cannot be matched in the source text are dropped to reduce hallucinations. Output is structured `Subsidiary` records written to Parquet.
+1. **Load** — read the scraper's `manifest.parquet` from the SEC bucket for the requested date range (or the most recent filings via `--daily`) to enumerate 10-K-family (Exhibit 21) and 20-F-family (Exhibit 8) filings; fetch per-company metadata (state of incorporation, business address, tickers, exchanges) from the SEC submissions API
+2. **Retrieval** — load each filing's already-scraped exhibit content from S3 (HTML, plain text, or PDF)
+3. **Extraction** — pass exhibit content to `gpt-4.1-nano` using structured output to parse subsidiary names and incorporation locations. Each subsidiary name is grounded against the exhibit text — exact match, then a punctuation-insensitive match, then a windowed in-order token match for names split across table columns — and names not found in the source are dropped to guard against hallucinations. Output is structured `Subsidiary` records written to Parquet.
 
 Processing tracks permanent failures to disk so interrupted runs do not re-attempt filings that will always fail.
 
 ### Output Layout
 
 ```
-output/
-  # Parquet — columns: parent_cik, name, location, source_quote, filing_date, form_type, accession_number, exhibit_url, date_added
-  {output_file}
-failures/
-  # permanent failures keyed by (cik, accession_number)
-  failures.json
+{output_file}   # Parquet — one row per subsidiary, with parent-company metadata
+                # columns: parent_cik, filing_date, form_type, exhibit_type,
+                #   accession_number, exhibit_url, name, location, parent_name,
+                #   parent_state_of_incorporation, parent_business_* (street/city/state/
+                #   zip/country/country_code), parent_tickers, parent_exchanges,
+                #   source_quote, date_added
+failures.json   # permanent failures keyed by (cik, accession_number)
 ```
 
-Paths support local directories or S3 URLs (`s3://bucket/path`).
+Output and failure paths support local directories or S3 URLs (`s3://bucket/path`). SEC input is always read from S3 via `--sec-bucket-prefix`.
 
 ---
 
@@ -51,33 +52,39 @@ export OPENAI_API_KEY='your-key'
 |---|---|
 | OpenAI API key | [platform.openai.com](https://platform.openai.com/api-keys) |
 
-AWS credentials are required only if using S3 paths for input or output.
+AWS credentials are always required: SEC input is read from S3 (the sec-scraper's bucket), and output/failures may also be S3 paths.
 
 ### Run
 
 ```bash
-uv run python3 -m src.idi_corporate_structure.processor.orchestrator \
-    --input-file "/local/input/submissions.zip" \
+uv run python3 -m src.idi_corporate_structure.orchestrator \
+    --sec-bucket-prefix "my-bucket/sec" \
     --output-file "/local/output/subsidiaries.parquet" \
     --failure-file "/local/failures/failures.json" \
-    --openai-api-key "sk-proj-xxxxxxxxxxxxx" \
+    --start-date "2026-05-01" \
+    --end-date "2026-05-31" \
+    --sec-user-agent "Your Name you@example.com" \
     --rate-limit 0.2 \
     --num-workers 10
 ```
 
-- To read the `submissions.zip` file in via HTTP from SEC EDGAR, pass the following URL into the `--input-file` argument:
-    - `https://www.sec.gov/Archives/edgar/daily-index/bulkdata/submissions.zip`
+- `OPENAI_API_KEY` is read from the environment (or pass `--openai-api-key`).
+- To process the most recent filings instead of an explicit range, replace `--start-date`/`--end-date` with `--daily` (optionally `--look-back N`, default 7). Daily mode reads the latest `filing_date` from `{sec-bucket-prefix}/manifest.parquet` and processes the trailing window.
 
 ### Configuration Reference
 
-| Field | Default | Description |
+| Flag | Default | Description |
 |---|---|---|
-| `input_file` | — | Required. Path to `submissions.zip` (local, `s3://`, or `https://`) |
-| `output_file` | — | Required. Path for Parquet output (local or `s3://`) |
-| `failure_file` | — | Required. Path to failures JSON; parent directory created if missing |
-| `failure_flush_every` | `50` | Write failures to disk after every N new entries |
-| `rate_limit` | `0.2` | Seconds between SEC HTTP requests (SEC limit: 10 req/s) |
-| `num_workers` | `10` | Number of concurrent GPT extraction worker threads |
+| `--sec-bucket-prefix` | — | Required. `bucket-name/prefix` where the sec-scraper wrote SEC data + `manifest.parquet` |
+| `--output-file` | — | Required. Path for Parquet output (local or `s3://`) |
+| `--failure-file` | — | Required. Path to failures JSON; parent directory created if missing |
+| `--daily` / `--start-date` | — | Required (mutually exclusive). Daily mode, or an explicit `--start-date`/`--end-date` range |
+| `--look-back` | `7` | Daily mode only: days to look back from the latest filing date |
+| `--sec-user-agent` | env `SEC_USER_AGENT` | Required. SEC EDGAR contact string (`Name email`) |
+| `--openai-api-key` | env `OPENAI_API_KEY` | Required. OpenAI API key |
+| `--model` | env `OPENAI_MODEL`, then `gpt-4.1-nano` | OpenAI model ID for extraction |
+| `--rate-limit` | `0.2` | Seconds between SEC HTTP requests (SEC limit: 10 req/s) |
+| `--num-workers` | `10` | Number of concurrent GPT extraction worker threads |
 
 ---
 
@@ -97,13 +104,15 @@ The pipeline ships with a multi-stage Dockerfile and Docker Compose files for ru
 
 All required variables must be set before running. Optional variables fall back to the listed defaults.
 
+The container runs `--daily` mode by default (see `compose.yml`), reading SEC input from S3, so AWS credentials must be available in the container (an instance role on EC2, or pass `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN` through locally).
+
 #### Required
 
 | Variable | Description |
 |---|---|
 | `OPENAI_API_KEY` | OpenAI API key for GPT extraction |
-| `INPUT_MOUNT_SOURCE` | Host directory containing the input file (e.g. `/data/input`) |
-| `INPUT_FILE` | Container-side path to the input file (e.g. `/data/input/submissions.zip`); can be an `https://` URL instead of a local path, in which case `INPUT_MOUNT_SOURCE` is unused |
+| `SEC_BUCKET_PREFIX` | `bucket-name/prefix` where the sec-scraper wrote SEC data + `manifest.parquet` (e.g. `my-bucket/sec`) |
+| `SEC_USER_AGENT` | SEC EDGAR contact string (`Name email`) |
 | `OUTPUT_MOUNT_SOURCE` | Host directory for Parquet output (e.g. `/data/output`) |
 | `FAILURE_MOUNT_SOURCE` | Host directory for failures JSON (e.g. `/data/failures`) |
 | `LOG_DIR` | Host directory for log files (e.g. `/data/logs`) |
@@ -112,12 +121,14 @@ All required variables must be set before running. Optional variables fall back 
 
 | Variable | Default | Description |
 |---|---|---|
-| `OUTPUT_FILE` | `/data/output/output.parquet` | Container-side path for Parquet output |
+| `OPENAI_MODEL` | `gpt-4.1-nano` | OpenAI model ID for extraction |
+| `OUTPUT_FILE` | `/data/output/subsidiaries.parquet` | Container-side path for Parquet output |
 | `FAILURE_FILE` | `/data/failures/failures.json` | Container-side path for failures JSON |
 | `RATE_LIMIT` | `0.2` | Seconds between SEC HTTP requests |
 | `NUM_WORKERS` | `10` | Number of concurrent GPT extraction worker threads |
-| `INPUT_SAMPLE_SIZE` | `0` | Limit input to N files for testing (`0` = no limit) |
+| `INPUT_SAMPLE_SIZE` | `0` | Limit input to N filings for testing (`0` = no limit) |
 | `AWS_REGION` | `us-east-2` | AWS region for S3 and CloudWatch |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` | — | AWS credentials for S3 (omit when using an instance role) |
 | `CLOUDWATCH_LOGS_ENABLED` | `false` | Enable CloudWatch log shipping |
 | `ORCHESTRATOR_IMAGE` | `ghcr.io/dsi-clinic/idi-corporate-structure-orchestrator:latest` | Image to pull on EC2 (ignored when building locally) |
 
@@ -127,10 +138,13 @@ All required variables must be set before running. Optional variables fall back 
 
 ```bash
 export OPENAI_API_KEY="sk-proj-xxxxxxxxxxxxx"
-export INPUT_MOUNT_SOURCE="/path/to/input"       # must contain submissions.zip
+export SEC_BUCKET_PREFIX="my-bucket/sec"         # sec-scraper output + manifest.parquet
+export SEC_USER_AGENT="Your Name you@example.com"
 export OUTPUT_MOUNT_SOURCE="/path/to/output"
 export FAILURE_MOUNT_SOURCE="/path/to/failures"
 export LOG_DIR="/path/to/logs"
+# AWS credentials for S3 (omit if the host provides an instance role)
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
 
 docker compose up --build orchestrator
 ```
@@ -175,12 +189,14 @@ The pipeline runs as an **ECS Fargate task** scheduled by **EventBridge Schedule
 
 ### S3 File Layout
 
-All pipeline files live in a single externally-managed S3 bucket:
+Everything lives in a single externally-managed S3 bucket (name from SSM). SEC input is written by the upstream sec-scraper under `{sec_prefix}/` (default `sec/`); this processor writes its output under `{app}/`:
 
 ```
 {bucket}/
+  {sec_prefix}/                 ← input, written by the sec-scraper
+    manifest.parquet            ← filing index the orchestrator reads (--sec-bucket-prefix)
+    ...                         ← scraped exhibit documents
   {app}/
-    input/submissions.zip       ← input (or pass an HTTPS URL via config)
     output/subsidiaries.parquet ← output
     failures/failures.json      ← permanent failure registry
 ```
@@ -206,7 +222,9 @@ uv run --group pulumi pulumi up
 | `aws:region` | `us-east-2` | AWS region |
 | `idi:app_name` | `corporate-structure` | Application name used in resource naming |
 | `idi:openai_api_key` | — | OpenAI API key (secret; stored in Secrets Manager) |
-| `idi:input_file` | SEC EDGAR HTTPS URL | Input path: a bucket-relative key (resolved against the shared bucket) or a full `s3://`/`https://` URI |
+| `idi:sec_user_agent` | — | Required. SEC EDGAR contact string (`Name email`) |
+| `idi:sec_prefix` | `sec` | Prefix within the shared bucket where the sec-scraper wrote SEC data; combined with the bucket name to form `--sec-bucket-prefix` |
+| `idi:openai_model` | `gpt-4.1-nano` | OpenAI model ID for extraction |
 | `idi:cron_corporate_structure` | `cron(0 2 * * ? *)` | EventBridge schedule expression |
 | `idi:schedule_enabled` | `false` | Enable the EventBridge schedule |
 | `idi:cpu` | `1024` | Fargate task CPU units |
@@ -271,36 +289,32 @@ docker buildx build --platform linux/amd64 \
 
 ## Data Flow
 
-The pipeline walks the SEC EDGAR data hierarchy one level at a time, from the bulk submissions archive down to individual exhibit documents:
+The pipeline consumes the sec-scraper's S3 output and walks down to individual exhibit documents:
 
 ```
-submissions.zip  (SEC EDGAR bulk data — one JSON blob per CIK)
+manifest.parquet  (sec-scraper index in S3 — one row per scraped filing/document)
   │
-  │  parse per-CIK JSON, filter to 10-K form type
+  │  iter_filings_by_form_type(): filter to 10-K (Ex. 21) / 20-F (Ex. 8) in the date range
   ▼
-10-K Filing  (CIK, accession number, filing date)
+Filing  (CIK, accession number, filing date, exhibit document s3_keys)
   │
-  │  GET https://www.sec.gov/Archives/edgar/data/{CIK}/{accession_number}/index.json
+  │  fetch company metadata from the SEC submissions API (state of incorporation, address, …)
   ▼
-10-K Directory Index  (list of all documents in the filing)
+Exhibit Document  (HTML, plain text, or PDF — already scraped)
   │
-  │  locate Exhibit 21 entry by document type / filename pattern
-  ▼
-Exhibit 21 Document  (HTML, plain text, or PDF)
-  │
-  │  download and extract text (PDF → pdfplumber)
+  │  load_content(s3_key) from S3, extract text (PDF → pdfplumber, HTML → text)
   ▼
 Exhibit Content  (raw text listing subsidiaries)
   │
-  │  POST to OpenAI with structured JSON schema
+  │  POST to OpenAI with structured JSON schema (chunked for large exhibits)
   ▼
 GPT Extraction  (gpt-4.1-nano, structured output)
   │
-  │  parse response into Subsidiary records
+  │  dedupe by name, ground each name against the exhibit text, attach parent metadata
   ▼
-Subsidiaries List  (name, location, parent CIK, accession number, …)
+Subsidiaries List  (name, location, parent CIK + metadata, accession number, …)
   │
-  │  deduplicate, append metadata, write via pandas
+  │  write via pandas
   ▼
 Parquet Output  ({output_file})
 ```
@@ -314,7 +328,7 @@ Each filing that cannot be processed (missing exhibit, empty content, document t
 ```
 pipeline.py
   └── SubsidiaryPipeline.run()
-        ├── load_input()       — parse submissions.zip → list[Filing]
+        ├── load_input()       — read scraper manifest from S3 → list[Filing]
         └── process()
               ├── Main thread (producer)
               │     for each Filing:
@@ -344,23 +358,19 @@ pipeline.py
 
 ### Modules
 
-**Common** (`src/idi_corporate_structure/common/`):
+This package (`src/idi_corporate_structure/`):
 
 | Module | Purpose |
 |---|---|
-| `api.py` | `ApiClient` base class (retries, rate limiting); `SecClient` for SEC EDGAR; `OpenAiClient` for GPT extraction |
-| `failures.py` | `FailureRegistry` — persists permanent failures to JSON on disk; `FailureClassifier` abstract base |
-| `logs.py` | Structured logging setup with optional CloudWatch (`watchtower`) integration |
-| `storage.py` | `load_json`/`save_json` and `open_zip` supporting local, `s3://`, and `https://` paths |
-
-**Processor** (`src/idi_corporate_structure/processor/`):
-
-| Module | Purpose |
-|---|---|
-| `types.py` | `Filing`, `Subsidiary`, `PipelineConfig`, and `PipelineStats` dataclasses |
-| `extractor.py` | `GptExtractor` — calls OpenAI with a structured JSON schema to parse subsidiary names and locations from exhibit text |
+| `orchestrator.py` | CLI entrypoint — parses arguments, resolves the date range, wires up the pipeline |
+| `pipeline.py` | `SubsidiaryPipeline` — orchestrates load, retrieval, and extraction; grounds names, dedupes, and writes Parquet output |
+| `extractor.py` | `GptExtractor` — calls OpenAI with a structured JSON schema (chunked for large exhibits) to parse subsidiary names and locations; grounds names against the exhibit text |
+| `api.py` | `OpenAiClient` for GPT extraction (subclass of the shared `ApiClient`) |
 | `failures.py` | `FailureType` enum and `CorporateStructureFailureClassifier` (maps HTTP responses to retryable vs permanent failures) |
-| `pipeline.py` | `SubsidiaryPipeline` — orchestrates collection, retrieval, and extraction; deduplicates and writes Parquet output |
+| `normalization.py` | Parent/subsidiary location normalization helpers |
+| `types.py` | `Filing`, `Subsidiary`, `CompanyMeta`, `PipelineConfig`, and `PipelineStats` dataclasses |
+
+Shared infrastructure lives in the [`idi-ftm2j-shared`](https://github.com/dsi-clinic/idi-ftm2j-shared) package: `api.ApiClient`/`SecClient` (retries, rate limiting), `failures.FailureRegistry`, `logs` (CloudWatch), `storage.load_content`, and `sec.iter_filings_by_form_type` (reads the scraper manifest).
 
 ### Failure Types
 
@@ -371,9 +381,13 @@ pipeline.py
 | `no_10k_filings` | No | CIK has no 10-K forms |
 | `no_overflow_filings` | No | CIK has no overflow filing entries |
 | `no_filing_directory` | No | SEC returned no directory listing for the filing |
-| `no_exhibit_content` | No | Exhibit URL returned no content |
+| `no_exhibit_found` | No | No exhibit file found in the filing directory |
+| `no_exhibit_content` | No | Exhibit returned no content |
 | `document_error` | No | Exhibit document is too long to process |
-| `extraction_failed` | Yes | GPT returned no subsidiary data |
+| `no_subsidiaries` | No | No subsidiaries found for the filing |
+| `truncated_error` | No | Model response cut off at the output token limit |
+| `extraction_failed` | Yes | GPT returned no structured data |
+| `timeout_error` | Yes | OpenAI API timed out |
 | `api_error` | Yes | Transient HTTP failure |
 | `rate_limit` | Yes | SEC 429 — retried with backoff |
 
@@ -385,7 +399,7 @@ Documentation governing all processors: https://github.com/dsi-clinic/idi-ftm2j-
 
 ### CI/CD specifics
 
-**No path filtering.** `deploy.yml` runs the full job sequence on every push to `dev` or `main` regardless of what changed — there is no change-detection gate.
+**Docs-only pushes are skipped.** `deploy.yml` runs on every push to `dev` or `main` except those touching only `**.md` / `docs/**` (`paths-ignore`); any code or infra change triggers the full job sequence.
 
 **Strict job sequence.** Jobs run in order: `version` → `docker` → `deploy-pulumi` → `sync-ecr`. Each job gates the next, so a Docker build failure will block the Pulumi deploy and ECR sync.
 
@@ -404,7 +418,7 @@ Documentation governing all processors: https://github.com/dsi-clinic/idi-ftm2j-
 | `PULUMI_STATE_BUCKET` | Yes | S3 bucket for Pulumi state |
 | `ECR_REPOSITORY_PREFIX` | No | Defaults to `{pulumi_project}-{env}-{app_name}` |
 | `BUCKET_NAME` | No | S3 bucket for pipeline I/O |
-| `INPUT_FILE` | No | S3 path or HTTPS URL to `submissions.zip`; defaults to SEC EDGAR bulk data URL |
+| `SEC_PREFIX` | No | Prefix within the bucket holding the sec-scraper output; defaults to `sec` |
 | `ECS_TASK_CPU` | No | |
 | `ECS_TASK_MEMORY` | No | |
 | `API_RATE_LIMIT` | No | Seconds between SEC HTTP requests |
