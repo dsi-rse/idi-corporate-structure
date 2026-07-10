@@ -242,6 +242,12 @@ class GptExtractor(Extractor):
         poor denominator for that layout rather than real loss, so it is not
         retried. Recovered rows are merged in and deduped by name.
 
+        The final chunk is never retried: it typically carries trailing
+        non-entity content (notes, legends, footnotes) that inflates its
+        ``input_rows`` denominator, so a low yield there is usually an artifact
+        rather than lost entities — re-extracting it just burns calls for no
+        recovery.
+
         Args:
             chunks: The chunk texts, in order.
             chunk_subs_list: Per-chunk extracted subsidiaries, aligned to ``chunks``.
@@ -256,11 +262,13 @@ class GptExtractor(Extractor):
             return chunk_subs_list
 
         yields = [self._chunk_yield(c, subs) for c, subs in zip(chunks, chunk_subs_list)]
+        last_index = len(chunks) - 1
 
         for i, (chunk, subs) in enumerate(zip(chunks, chunk_subs_list)):
             sibling_median = statistics.median([y for j, y in enumerate(yields) if j != i])
             is_outlier = (
-                yields[i] < self._LOW_YIELD_RATIO
+                i != last_index  # trailing notes make the final chunk a false outlier
+                and yields[i] < self._LOW_YIELD_RATIO
                 and sibling_median >= self._LOW_YIELD_RATIO
                 and yields[i] < self._SIBLING_OUTLIER_FACTOR * sibling_median
             )

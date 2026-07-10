@@ -787,24 +787,44 @@ class TestRetryOutlierChunks:
         return "\n\n".join(f"{prefix}{i} LLC (Delaware)" for i in range(n))
 
     def test_reextracts_sibling_outlier_chunk(self, mocker):
-        """A chunk whose yield is far below its siblings is re-extracted and merged."""
+        """A non-final chunk whose yield is far below its siblings is re-extracted."""
         extractor = GptExtractor(openai_api_key="fake-key")
         chunks = [self._chunk("A", 10), self._chunk("B", 10), self._chunk("C", 10)]
         subs = [
             [self._sub(f"A{i} LLC") for i in range(9)],  # yield 0.9
-            [self._sub(f"B{i} LLC") for i in range(9)],  # yield 0.9
-            [self._sub(f"C{i} LLC") for i in range(3)],  # yield 0.3 → outlier
+            [self._sub(f"B{i} LLC") for i in range(3)],  # yield 0.3 → outlier (middle chunk)
+            [self._sub(f"C{i} LLC") for i in range(9)],  # yield 0.9
         ]
         recover = mocker.patch.object(
             extractor,
             "_reextract_outlier",
-            return_value=[self._sub(f"C{i} LLC") for i in range(10)],
+            return_value=[self._sub(f"B{i} LLC") for i in range(10)],
         )
 
         out = extractor._retry_outlier_chunks(chunks, subs, "ACME", "url")
 
         recover.assert_called_once()
-        assert [len(s) for s in out] == [9, 9, 10]  # outlier recovered, siblings untouched
+        assert [len(s) for s in out] == [9, 10, 9]  # outlier recovered, siblings untouched
+
+    def test_final_chunk_not_retried(self, mocker):
+        """The last chunk is never retried: trailing notes make it a false outlier.
+
+        Mirrors the observed Genie / DR Reddy's tail chunks (yield 0.48 / 0.32)
+        that recovered nothing on retry.
+        """
+        extractor = GptExtractor(openai_api_key="fake-key")
+        recover = mocker.patch.object(extractor, "_reextract_outlier")
+        chunks = [self._chunk("A", 10), self._chunk("B", 10), self._chunk("C", 10)]
+        subs = [
+            [self._sub(f"A{i} LLC") for i in range(9)],  # yield 0.9
+            [self._sub(f"B{i} LLC") for i in range(9)],  # yield 0.9
+            [self._sub(f"C{i} LLC") for i in range(3)],  # yield 0.3 but it is the LAST chunk
+        ]
+
+        out = extractor._retry_outlier_chunks(chunks, subs, "Genie", "url")
+
+        recover.assert_not_called()
+        assert [len(s) for s in out] == [9, 9, 3]
 
     def test_uniformly_low_yield_not_retried(self, mocker):
         """All-chunks-low (an input_rows artifact, e.g. VIASAT) must not trigger retries."""
