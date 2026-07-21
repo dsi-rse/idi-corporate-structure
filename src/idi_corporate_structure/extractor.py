@@ -207,8 +207,10 @@ class GptExtractor(Extractor):
 
         Splitting the chunk into fewer-entry sub-chunks counters the per-chunk
         "laziness" that makes the model return only part of a dense list. A
-        sub-chunk that truncates is logged and skipped rather than raised — the
-        retry is best-effort recovery layered on top of the original result.
+        sub-chunk that fails (truncation, timeout, or another API RuntimeError)
+        is logged and skipped rather than raised — the retry is best-effort
+        recovery layered on top of an already-successful original result, so it
+        must never sink the overall extraction.
 
         Args:
             chunk: The chunk text to re-extract.
@@ -220,11 +222,18 @@ class GptExtractor(Extractor):
             chunk, _CHUNK_MAX_CHARS, _CHUNK_OVERLAP_CHARS, self._RETRY_MAX_ENTRIES
         )
         recovered: list[dict] = []
-        for sub_chunk in sub_chunks:
+        for i, sub_chunk in enumerate(sub_chunks, start=1):
             try:
                 recovered.extend(self._summarize(sub_chunk).get("subsidiaries", []))
-            except ExtractionTruncatedError:
-                self._logger.error("Retry sub-chunk truncated; keeping partial recovery")
+            except RuntimeError as e:
+                self._logger.error(
+                    "Retry sub-chunk %d/%d (%d chars) failed (%s: %s); keeping partial recovery",
+                    i,
+                    len(sub_chunks),
+                    len(sub_chunk),
+                    type(e).__name__,
+                    e,
+                )
         return recovered
 
     def _retry_outlier_chunks(

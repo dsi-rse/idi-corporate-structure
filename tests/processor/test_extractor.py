@@ -881,6 +881,20 @@ class TestRetryOutlierChunks:
 
         assert extractor._reextract_outlier(self._chunk("Row", 60)) == []
 
+    def test_reextract_outlier_swallows_timeout(self, mocker):
+        """A timed-out sub-chunk must not sink an already-successful extraction."""
+        extractor = GptExtractor(openai_api_key="fake-key")
+        mocker.patch.object(extractor, "_summarize", side_effect=ExtractionTimeoutError("timed out"))
+
+        assert extractor._reextract_outlier(self._chunk("Row", 60)) == []
+
+    def test_reextract_outlier_swallows_runtime_error(self, mocker):
+        """A generic API RuntimeError on the best-effort retry is logged and skipped."""
+        extractor = GptExtractor(openai_api_key="fake-key")
+        mocker.patch.object(extractor, "_summarize", side_effect=RuntimeError("api error"))
+
+        assert extractor._reextract_outlier(self._chunk("Row", 60)) == []
+
 
 class TestWindowedSubsequenceGrounding:
     """Windowed in-order token fallback + control/zero-width stripping in grounding."""
