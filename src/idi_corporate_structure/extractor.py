@@ -242,7 +242,7 @@ class GptExtractor(Extractor):
         chunk_subs_list: list[list[dict]],
         company_name: str,
         doc_url: str,
-    ):
+    ) -> None:
         """Re-extract chunks whose yield is a sharp outlier vs their siblings.
 
         A per-chunk yield well below the sibling median signals mid-document

@@ -884,7 +884,9 @@ class TestRetryOutlierChunks:
     def test_reextract_outlier_swallows_timeout(self, mocker):
         """A timed-out sub-chunk must not sink an already-successful extraction."""
         extractor = GptExtractor(openai_api_key="fake-key")
-        mocker.patch.object(extractor, "_summarize", side_effect=ExtractionTimeoutError("timed out"))
+        mocker.patch.object(
+            extractor, "_summarize", side_effect=ExtractionTimeoutError("timed out")
+        )
 
         assert extractor._reextract_outlier(self._chunk("Row", 60)) == []
 
@@ -920,8 +922,10 @@ class TestWindowedSubsequenceGrounding:
         assert not _is_name_in_document("Ghost", "Alpha Beta Gamma Holdings")
 
     def test_absent_later_token_rejected_despite_repeated_first_token(self):
-        """A later token missing from the doc grounds to False even when the first
-        token recurs — the early exit must not be defeated by extra occurrences."""
+        """A missing later token grounds to False even when the first token recurs.
+
+        The early exit must not be defeated by extra occurrences of the first token.
+        """
         from idi_corporate_structure.extractor import _is_name_in_document
 
         doc = "Alpha Corp and Alpha Trust and Alpha Group"  # "Alpha" thrice, "Beta" absent
