@@ -242,7 +242,7 @@ class GptExtractor(Extractor):
         chunk_subs_list: list[list[dict]],
         company_name: str,
         doc_url: str,
-    ) -> list[list[dict]]:
+    ):
         """Re-extract chunks whose yield is a sharp outlier vs their siblings.
 
         A per-chunk yield well below the sibling median signals mid-document
@@ -257,18 +257,17 @@ class GptExtractor(Extractor):
         rather than lost entities — re-extracting it just burns calls for no
         recovery.
 
+        ``chunk_subs_list`` with outlier chunks replaced by their merged
+        (original + recovered) subsidiaries.
+
         Args:
             chunks: The chunk texts, in order.
             chunk_subs_list: Per-chunk extracted subsidiaries, aligned to ``chunks``.
             company_name: Filing company name, for log lines.
             doc_url: SEC URL of the exhibit, for log lines.
-
-        Returns:
-            ``chunk_subs_list`` with outlier chunks replaced by their merged
-            (original + recovered) subsidiaries.
         """
         if len(chunks) < self._MIN_CHUNKS_FOR_RETRY:
-            return chunk_subs_list
+            return
 
         yields = [self._chunk_yield(c, subs) for c, subs in zip(chunks, chunk_subs_list)]
         last_index = len(chunks) - 1
@@ -305,8 +304,6 @@ class GptExtractor(Extractor):
                 doc_url,
             )
             chunk_subs_list[i] = merged
-
-        return chunk_subs_list
 
     def _summarize_chunks(
         self, doc_text: str, company_name: str, doc_url: str
@@ -349,7 +346,7 @@ class GptExtractor(Extractor):
             self._log_chunk(chunk, chunk_subs, company_name, doc_url, i, len(chunks))
             chunk_subs_list.append(chunk_subs)
 
-        chunk_subs_list = self._retry_outlier_chunks(chunks, chunk_subs_list, company_name, doc_url)
+        self._retry_outlier_chunks(chunks, chunk_subs_list, company_name, doc_url)
 
         all_subs = [sub for chunk_subs in chunk_subs_list for sub in chunk_subs]
         return all_subs, len(chunks)
@@ -807,7 +804,13 @@ def _name_tokens_in_window(name: str, document_normalized: str) -> bool:
         matched = True
         for token in tokens[1:]:
             nxt = document_normalized.find(token, pos)
-            if nxt == -1 or nxt - first > _SUBSEQUENCE_WINDOW_CHARS:
+            if nxt == -1:
+                # Token absent from the rest of the doc; sliding the first token
+                # forward only pushes the search later, so no match can exist.
+                return False
+            if nxt - first > _SUBSEQUENCE_WINDOW_CHARS:
+                # Found but out of window; a later occurrence of the first token
+                # may pull the span back within the window, so retry.
                 matched = False
                 break
             pos = nxt + len(token)

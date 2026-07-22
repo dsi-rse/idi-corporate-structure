@@ -919,6 +919,14 @@ class TestWindowedSubsequenceGrounding:
 
         assert not _is_name_in_document("Ghost", "Alpha Beta Gamma Holdings")
 
+    def test_absent_later_token_rejected_despite_repeated_first_token(self):
+        """A later token missing from the doc grounds to False even when the first
+        token recurs — the early exit must not be defeated by extra occurrences."""
+        from idi_corporate_structure.extractor import _is_name_in_document
+
+        doc = "Alpha Corp and Alpha Trust and Alpha Group"  # "Alpha" thrice, "Beta" absent
+        assert not _is_name_in_document("Alpha Beta", doc)
+
     def test_windowed_match_logs_debug(self, mocker):
         from idi_corporate_structure import extractor as ext_mod
 
