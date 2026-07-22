@@ -257,12 +257,14 @@ class GptExtractor(Extractor):
         rather than lost entities — re-extracting it just burns calls for no
         recovery.
 
-        ``chunk_subs_list`` with outlier chunks replaced by their merged
-        (original + recovered) subsidiaries.
+        Mutates ``chunk_subs_list`` in place, replacing each outlier chunk's
+        entry with its merged (original + recovered) subsidiaries. Returns
+        nothing.
 
         Args:
             chunks: The chunk texts, in order.
-            chunk_subs_list: Per-chunk extracted subsidiaries, aligned to ``chunks``.
+            chunk_subs_list: Per-chunk extracted subsidiaries, aligned to
+                ``chunks``; modified in place for outlier chunks.
             company_name: Filing company name, for log lines.
             doc_url: SEC URL of the exhibit, for log lines.
         """

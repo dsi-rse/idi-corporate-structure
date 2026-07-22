@@ -801,10 +801,10 @@ class TestRetryOutlierChunks:
             return_value=[self._sub(f"B{i} LLC") for i in range(10)],
         )
 
-        out = extractor._retry_outlier_chunks(chunks, subs, "ACME", "url")
+        extractor._retry_outlier_chunks(chunks, subs, "ACME", "url")
 
         recover.assert_called_once()
-        assert [len(s) for s in out] == [9, 10, 9]  # outlier recovered, siblings untouched
+        assert [len(s) for s in subs] == [9, 10, 9]  # outlier recovered, siblings untouched
 
     def test_final_chunk_not_retried(self, mocker):
         """The last chunk is never retried: trailing notes make it a false outlier.
@@ -821,10 +821,10 @@ class TestRetryOutlierChunks:
             [self._sub(f"C{i} LLC") for i in range(3)],  # yield 0.3 but it is the LAST chunk
         ]
 
-        out = extractor._retry_outlier_chunks(chunks, subs, "Genie", "url")
+        extractor._retry_outlier_chunks(chunks, subs, "Genie", "url")
 
         recover.assert_not_called()
-        assert [len(s) for s in out] == [9, 9, 3]
+        assert [len(s) for s in subs] == [9, 9, 3]
 
     def test_uniformly_low_yield_not_retried(self, mocker):
         """All-chunks-low (an input_rows artifact, e.g. VIASAT) must not trigger retries."""
@@ -833,10 +833,10 @@ class TestRetryOutlierChunks:
         chunks = [self._chunk(p, 100) for p in ("A", "B", "C")]
         subs = [[self._sub(f"{p}{i} LLC") for i in range(49)] for p in ("A", "B", "C")]  # ~0.49
 
-        out = extractor._retry_outlier_chunks(chunks, subs, "VIASAT", "url")
+        extractor._retry_outlier_chunks(chunks, subs, "VIASAT", "url")
 
         recover.assert_not_called()
-        assert [len(s) for s in out] == [49, 49, 49]
+        assert [len(s) for s in subs] == [49, 49, 49]
 
     def test_healthy_chunks_not_retried(self, mocker):
         extractor = GptExtractor(openai_api_key="fake-key")
