@@ -683,7 +683,7 @@ pulumi = [
 requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.12" },
     { name = "boto3", specifier = ">=1.42.70" },
-    { name = "idi-ftm2j-shared", specifier = ">=0.1.3" },
+    { name = "idi-ftm2j-shared", specifier = "==0.1.7" },
     { name = "pandas", specifier = ">=3.0.2" },
     { name = "pdfplumber", specifier = ">=0.11" },
     { name = "pip-audit", marker = "extra == 'dev'", specifier = ">=2.10.0" },
@@ -711,7 +711,7 @@ pulumi = [
 
 [[package]]
 name = "idi-ftm2j-shared"
-version = "0.1.13"
+version = "0.1.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
@@ -720,9 +720,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "watchtower" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/37/75/666d7c9ea3b6aa6d803dc2dbbc3a6bf911db39bd2b586a6ff91716ec3774/idi_ftm2j_shared-0.1.13.tar.gz", hash = "sha256:5b7bbb511096108a7e174ec166840b48c51e35a9d2e597c7899b4ca2ea14ffbf", size = 118569, upload-time = "2026-07-17T14:04:51.984Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/50/68/0953337064b3df75543da8e896f22e819b083e8fc5a86e2488d282c911ac/idi_ftm2j_shared-0.1.7.tar.gz", hash = "sha256:833f3be9cf2ea02f575532d4b7c9cb15a0713544fa2a56d771eb22826d489a77", size = 109065, upload-time = "2026-06-24T21:00:14.838Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9e/8c/e53a5ca67b72618234fd599395fcfc660b148bb3a08f8867ff200b1cf305/idi_ftm2j_shared-0.1.13-py3-none-any.whl", hash = "sha256:3a782c41aa0c579b5bdaa43a2fe758c75adc213994918050b054741ad009a3e2", size = 21305, upload-time = "2026-07-17T14:04:50.776Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/9b/5b2ef652c5654a5380c37fdec256c596a06ead30c06f10b501ad1f42e098/idi_ftm2j_shared-0.1.7-py3-none-any.whl", hash = "sha256:6e6f1598c008cd514fc00211b1717bae62282b7fdb1d0de7f00bfa2dda0313fe", size = 20953, upload-time = "2026-06-24T21:00:13.525Z" },
 ]
 
 [[package]]
