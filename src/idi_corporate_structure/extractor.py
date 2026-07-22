@@ -780,11 +780,13 @@ def _name_tokens_in_window(name: str, document_normalized: str) -> bool:
     columns land between the name's words, so the full name is not a contiguous
     substring even though every word is present, in order, and close together.
 
-    Every token must appear in order within ``_SUBSEQUENCE_WINDOW_CHARS`` of the
-    first, so a fabricated name whose words happen to be scattered far apart is
-    still rejected — this preserves the hallucination guard. Single-token names
-    are not eligible: strict/compact already cover a lone token, and admitting
-    it here would only loosen the check.
+    Tokens are matched in order, and each must *start* within
+    ``_SUBSEQUENCE_WINDOW_CHARS`` of where the first token starts (the bound is
+    on start offsets, so a token may extend past the window as long as it begins
+    inside it). A fabricated name whose words are scattered far apart is
+    therefore still rejected — this preserves the hallucination guard.
+    Single-token names are not eligible: strict/compact already cover a lone
+    token, and admitting it here would only loosen the check.
 
     Args:
         name: Candidate subsidiary name.
