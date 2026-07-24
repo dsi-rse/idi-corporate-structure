@@ -17,7 +17,7 @@ dependencies = [
     "boto3>=1.42.70",
     # Pinned to 0.1.7 to exclude the 0.1.13 scraped-at filing model; the
     # last-scraped-at pull approach will be adopted in a separate issue.
-    "idi-ftm2j-shared==0.1.7",
+    "idi-ftm2j-shared>=0.1.13",
     "pandas>=3.0.2",
     "pdfplumber>=0.11",
     "pyarrow>=23.0.1",
