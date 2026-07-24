@@ -49,7 +49,6 @@ def make_scraped_filing(
         accession_number=accession_number,
         form_type=form_type,
         filing_date=filing_date,
-        last_scraped_at="2024-01-01T00:00:00+00:00",
         index_url=f"https://www.sec.gov/Archives/edgar/data/{cik}/index.htm",
         company_name=company_name,
         documents=documents if documents is not None else [make_scraped_document()],

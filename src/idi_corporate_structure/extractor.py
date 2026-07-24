@@ -5,6 +5,7 @@ import html as _html
 import importlib.resources
 import json
 import re
+import statistics
 from abc import ABC, abstractmethod
 
 # Third-party imports
@@ -46,8 +47,18 @@ _CHUNK_MAX_ENTRIES = 75  # protects against per-chunk laziness
 _CHUNK_OVERLAP_CHARS = 400
 
 _INVISIBLE_CHARS_RE = re.compile(r"[\u200b\u200c\u200d\ufeff]")
+# C0 control characters that str.split() does NOT treat as whitespace (so they
+# survive into a name/document and break grounding). Excludes \t \n \r \x0b \x0c,
+# which split() already collapses.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
 _PUNCT_RE = re.compile(r"[^\w]+")
 _TRAILING_FOOTNOTE_RE = re.compile(r"\s*\(\d+\)\s*$")
+
+# Grounding: a multi-word name whose tokens appear in order within this many
+# characters is treated as present, recovering names that html_to_text shattered
+# across table columns. Kept tight so scattered tokens don't pass the guard.
+_SUBSEQUENCE_WINDOW_CHARS = 250
+_MIN_SUBSEQUENCE_TOKENS = 2  # single-token names use strict/compact only
 
 
 class DocumentError(Exception):
@@ -93,6 +104,13 @@ class GptExtractor(Extractor):
     _MAX_COMPLETION_TOKENS = 32768  # surfaces finish_reason="length" when truncation occurs
     _DEFAULT_MODEL = "gpt-4.1-nano"
     _LOW_YIELD_RATIO = 0.6  # per-chunk yield (output rows / input rows)
+    # Re-extract a chunk whose yield is below this fraction of its sibling
+    # chunks' median yield - a sharp outlier signals mid-document truncation,
+    # whereas a uniformly low yield usually means input_rows is a poor
+    # denominator for that layout (not real loss), so it is left alone.
+    _SIBLING_OUTLIER_FACTOR = 0.6
+    _RETRY_MAX_ENTRIES = 25  # smaller entry cap when re-extracting an outlier chunk
+    _MIN_CHUNKS_FOR_RETRY = 2  # need at least one sibling to judge an outlier
     _SYSTEM_PROMPT: str = (
         _PROMPTS.joinpath("gpt_extractor_system.txt").read_text(encoding="utf-8").strip()
     )
@@ -140,6 +158,16 @@ class GptExtractor(Extractor):
             self._logger.info("One-shot extraction truncated; retrying with chunking")
             return self._summarize_chunks(doc_text, company_name, doc_url)
 
+    @staticmethod
+    def _chunk_input_rows(chunk: str) -> int:
+        """Approximate the number of entity rows in a chunk (its paragraph count)."""
+        return chunk.count("\n\n") + 1
+
+    def _chunk_yield(self, chunk: str, chunk_subs: list[dict]) -> float:
+        """Return output-rows / input-rows for a chunk (0.0 when it has no rows)."""
+        input_rows = self._chunk_input_rows(chunk)
+        return len(chunk_subs) / input_rows if input_rows else 0.0
+
     def _log_chunk(
         self,
         chunk: str,
@@ -159,9 +187,9 @@ class GptExtractor(Extractor):
             i: The index of the chunk.
             num_chunks: The number of chunks.
         """
-        input_rows = chunk.count("\n\n") + 1
+        input_rows = self._chunk_input_rows(chunk)
         output_rows = len(chunk_subs)
-        yield_ratio = output_rows / input_rows if input_rows else 0.0
+        yield_ratio = self._chunk_yield(chunk, chunk_subs)
         log = self._logger.warning if yield_ratio < self._LOW_YIELD_RATIO else self._logger.info
         log(
             "%s chunk %d/%d: %d input rows → %d extracted (yield=%.2f) @ %s",
@@ -173,6 +201,111 @@ class GptExtractor(Extractor):
             yield_ratio,
             doc_url,
         )
+
+    def _reextract_outlier(self, chunk: str) -> list[dict]:
+        """Re-extract one low-yield chunk with a smaller entry cap.
+
+        Splitting the chunk into fewer-entry sub-chunks counters the per-chunk
+        "laziness" that makes the model return only part of a dense list. A
+        sub-chunk that fails (truncation, timeout, or another API RuntimeError)
+        is logged and skipped rather than raised — the retry is best-effort
+        recovery layered on top of an already-successful original result, so it
+        must never sink the overall extraction.
+
+        Args:
+            chunk: The chunk text to re-extract.
+
+        Returns:
+            Raw subsidiary dicts recovered from the sub-chunks (possibly empty).
+        """
+        sub_chunks = _chunk_document(
+            chunk, _CHUNK_MAX_CHARS, _CHUNK_OVERLAP_CHARS, self._RETRY_MAX_ENTRIES
+        )
+        recovered: list[dict] = []
+        for i, sub_chunk in enumerate(sub_chunks, start=1):
+            try:
+                recovered.extend(self._summarize(sub_chunk).get("subsidiaries", []))
+            except RuntimeError as e:
+                self._logger.error(
+                    "Retry sub-chunk %d/%d (%d chars) failed (%s: %s); keeping partial recovery",
+                    i,
+                    len(sub_chunks),
+                    len(sub_chunk),
+                    type(e).__name__,
+                    e,
+                )
+        return recovered
+
+    def _retry_outlier_chunks(
+        self,
+        chunks: list[str],
+        chunk_subs_list: list[list[dict]],
+        company_name: str,
+        doc_url: str,
+    ) -> None:
+        """Re-extract chunks whose yield is a sharp outlier vs their siblings.
+
+        A per-chunk yield well below the sibling median signals mid-document
+        truncation (the model returned far fewer rows than the chunk holds). A
+        *uniformly* low yield, by contrast, usually means ``input_rows`` is a
+        poor denominator for that layout rather than real loss, so it is not
+        retried. Recovered rows are merged in and deduped by name.
+
+        The final chunk is never retried: it typically carries trailing
+        non-entity content (notes, legends, footnotes) that inflates its
+        ``input_rows`` denominator, so a low yield there is usually an artifact
+        rather than lost entities — re-extracting it just burns calls for no
+        recovery.
+
+        Mutates ``chunk_subs_list`` in place, replacing each outlier chunk's
+        entry with its merged (original + recovered) subsidiaries. Returns
+        nothing.
+
+        Args:
+            chunks: The chunk texts, in order.
+            chunk_subs_list: Per-chunk extracted subsidiaries, aligned to
+                ``chunks``; modified in place for outlier chunks.
+            company_name: Filing company name, for log lines.
+            doc_url: SEC URL of the exhibit, for log lines.
+        """
+        if len(chunks) < self._MIN_CHUNKS_FOR_RETRY:
+            return
+
+        yields = [self._chunk_yield(c, subs) for c, subs in zip(chunks, chunk_subs_list)]
+        last_index = len(chunks) - 1
+
+        for i, (chunk, subs) in enumerate(zip(chunks, chunk_subs_list)):
+            sibling_median = statistics.median([y for j, y in enumerate(yields) if j != i])
+            is_outlier = (
+                i != last_index  # trailing notes make the final chunk a false outlier
+                and yields[i] < self._LOW_YIELD_RATIO
+                and sibling_median >= self._LOW_YIELD_RATIO
+                and yields[i] < self._SIBLING_OUTLIER_FACTOR * sibling_median
+            )
+            if not is_outlier:
+                continue
+
+            self._logger.warning(
+                "%s chunk %d/%d yield %.2f is a sharp outlier (sibling median %.2f) - "
+                "re-extracting @ %s",
+                company_name,
+                i + 1,
+                len(chunks),
+                yields[i],
+                sibling_median,
+                doc_url,
+            )
+            merged = dedup_by_name(subs + self._reextract_outlier(chunk))
+            self._logger.info(
+                "%s chunk %d/%d retry: %d → %d rows after merge @ %s",
+                company_name,
+                i + 1,
+                len(chunks),
+                len(subs),
+                len(merged),
+                doc_url,
+            )
+            chunk_subs_list[i] = merged
 
     def _summarize_chunks(
         self, doc_text: str, company_name: str, doc_url: str
@@ -198,7 +331,7 @@ class GptExtractor(Extractor):
             "%s chunked extraction: %d chunks @ %s", company_name, len(chunks), doc_url
         )
 
-        all_subs: list[dict] = []
+        chunk_subs_list: list[list[dict]] = []
         for i, chunk in enumerate(chunks, 1):
             try:
                 result = self._summarize(chunk)
@@ -213,8 +346,11 @@ class GptExtractor(Extractor):
 
             chunk_subs = result.get("subsidiaries", [])
             self._log_chunk(chunk, chunk_subs, company_name, doc_url, i, len(chunks))
-            all_subs.extend(chunk_subs)
+            chunk_subs_list.append(chunk_subs)
 
+        self._retry_outlier_chunks(chunks, chunk_subs_list, company_name, doc_url)
+
+        all_subs = [sub for chunk_subs in chunk_subs_list for sub in chunk_subs]
         return all_subs, len(chunks)
 
     def _get_request_data_json(self, document: str) -> dict:
@@ -380,11 +516,14 @@ class GptExtractor(Extractor):
 
         doc_text = document.get("data", "")
         doc_url = document.get("url", "")
+        # Normalize the document once and reuse across every name, rather than
+        # re-normalizing the whole exhibit per subsidiary.
         doc_text_normalized = _normalize(doc_text)
+        doc_text_compact = _compact(doc_text)
 
         for sub in subsidiaries:
             name = sub.get("name", "")
-            if not _is_name_in_document(name, doc_text):
+            if not _is_name_grounded(name, doc_text_normalized, doc_text_compact):
                 self._logger.warning("Dropped %r from %s (name not in document)", name, doc_url)
                 ungrounded_name += 1
                 continue
@@ -633,43 +772,131 @@ def _compact(s: str) -> str:
     return _PUNCT_RE.sub("", _normalize(s))
 
 
-def _is_name_in_document(name: str, document: str) -> bool:
-    """Check if a name appears in the document (the source of truth).
+def _name_tokens_in_window(name: str, document_normalized: str) -> bool:
+    """Return True if the name's tokens appear in order within a bounded window.
+
+    Recovers multi-word names that ``html_to_text`` shattered across table
+    columns: when a wrapped name cell is linearized row-major, the row's other
+    columns land between the name's words, so the full name is not a contiguous
+    substring even though every word is present, in order, and close together.
+
+    Tokens are matched in order, and each must *start* within
+    ``_SUBSEQUENCE_WINDOW_CHARS`` of where the first token starts (the bound is
+    on start offsets, so a token may extend past the window as long as it begins
+    inside it). A fabricated name whose words are scattered far apart is
+    therefore still rejected — this preserves the hallucination guard.
+    Single-token names are not eligible: strict/compact already cover a lone
+    token, and admitting it here would only loosen the check.
+
+    Args:
+        name: Candidate subsidiary name.
+        document_normalized: The already-``_normalize``d document text.
+
+    Returns:
+        True if the name's tokens form an in-order, windowed subsequence.
+    """
+    tokens = _normalize(name).split()
+    if len(tokens) < _MIN_SUBSEQUENCE_TOKENS:
+        return False
+
+    start = 0
+    while True:
+        first = document_normalized.find(tokens[0], start)
+        if first == -1:
+            return False
+        pos = first + len(tokens[0])
+        matched = True
+        for token in tokens[1:]:
+            nxt = document_normalized.find(token, pos)
+            if nxt == -1:
+                # Token absent from the rest of the doc; sliding the first token
+                # forward only pushes the search later, so no match can exist.
+                return False
+            if nxt - first > _SUBSEQUENCE_WINDOW_CHARS:
+                # Found but out of window; a later occurrence of the first token
+                # may pull the span back within the window, so retry.
+                matched = False
+                break
+            pos = nxt + len(token)
+        if matched:
+            return True
+        start = first + 1
+
+
+def _is_name_grounded(name: str, document_normalized: str, document_compact: str) -> bool:
+    """Check if a name is grounded against pre-normalized document forms.
 
     Tries a strict normalized substring match first. If that fails, falls
     back to a compact (punctuation-stripped) match to catch cases where the
     model returned a name with minor punctuation or whitespace differences
     from the exhibit (e.g. dropped parentheses, "Health Care" vs
-    "Healthcare").
+    "Healthcare"). Finally, for multi-word names, falls back to a windowed
+    in-order token match to recover names shattered across table columns by
+    ``html_to_text`` linearization.
+
+    The document forms are passed in so the caller can compute them once per
+    exhibit and reuse them across every candidate name, rather than
+    re-normalizing the whole document for each subsidiary.
 
     Args:
         name: The name to check.
-        document: The document text to check for the name.
+        document_normalized: The document text after ``_normalize``.
+        document_compact: The document text after ``_compact``.
 
     Returns:
-        True if the name is found via the strict or compact match,
+        True if the name is found via the strict, compact, or windowed match,
         False otherwise.
     """
     if not name:
         return False
 
-    if _normalize(name) in _normalize(document):
+    if _normalize(name) in document_normalized:
         return True
 
-    if _compact(name) in _compact(document):
+    if _compact(name) in document_compact:
         get_logger(__name__).debug(
             "Name %r matched via compact fallback (model produced a slight variant)", name
+        )
+        return True
+
+    if _name_tokens_in_window(name, document_normalized):
+        get_logger(__name__).debug(
+            "Name %r matched via windowed-subsequence fallback (table-shattered layout)", name
         )
         return True
 
     return False
 
 
+def _is_name_in_document(name: str, document: str) -> bool:
+    """Check if a name appears in the document, normalizing the document inline.
+
+    Thin convenience wrapper over :func:`_is_name_grounded` for callers with a
+    single name to check (and the test suite). Hot loops over many names should
+    call :func:`_is_name_grounded` with document forms computed once.
+
+    Args:
+        name: The name to check.
+        document: The raw document text to check for the name.
+
+    Returns:
+        True if the name is found via the strict, compact, or windowed match.
+    """
+    return _is_name_grounded(name, _normalize(document), _compact(document))
+
+
 def _normalize(s: str) -> str:
-    """Decode HTML entities, normalize apostrophes and whitespace, and lowercase."""
+    r"""Decode HTML entities, normalize apostrophes and whitespace, and lowercase.
+
+    Zero-width and control characters are stripped so they cannot wedge
+    themselves between a name's words and defeat the grounding substring match
+    (e.g. an exhibit that renders ``VisitIQ,\r2LLC`` or ``USCNHK Group\x01...``).
+    """
     s = _html.unescape(s)
     s = s.replace("\u2019", "'").replace("\u2018", "'")
     s = s.replace("\u201c", '"').replace("\u201d", '"')
+    s = _INVISIBLE_CHARS_RE.sub("", s)
+    s = _CONTROL_CHARS_RE.sub(" ", s)
     return " ".join(s.split()).lower()
 
 

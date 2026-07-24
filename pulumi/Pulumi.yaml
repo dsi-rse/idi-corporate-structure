@@ -46,11 +46,12 @@ config:
     description: Whether the EventBridge schedule is enabled
     default: "false"
 
-  idi:input_file:
+  idi:sec_prefix:
     description: >-
-      Input path the orchestrator reads. A bucket-relative key (resolved against
-      the shared bucket from SSM) or a full URI (s3:// or https://, used as-is).
-    default: "https://www.sec.gov/Archives/edgar/daily-index/bulkdata/submissions.zip"
+      Key prefix within the shared processor bucket where the sec-scraper writes
+      SEC data and manifest.parquet. Combined with the bucket name (from SSM) to
+      form the orchestrator's --sec-bucket-prefix (bucket/prefix).
+    default: "sec"
 
   idi:log_retention_days:
     description: CloudWatch log group retention in days

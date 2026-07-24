@@ -1,6 +1,6 @@
 """ECS cluster and Fargate task definition for the corporate structure processor.
 
-Per-pipeline arguments (input file, type, batch size, etc.) are injected by the
+Per-pipeline arguments (SEC bucket prefix, mode, etc.) are injected by the
 EventBridge schedules via ECS containerOverrides — see scheduling.py. The task
 definition's baseline command is `--help` so a misconfigured override fails
 loudly instead of silently running a default pipeline.
@@ -42,11 +42,11 @@ input_sample_size = config.config.get("input_sample_size") or "0"
 openai_model = config.config.get("openai_model") or "gpt-4.1-nano"
 
 # Build S3 paths from the externally managed bucket (name from SSM via config).
-# input_file is a bucket-relative key resolved against config.bucket_name, unless
-# it already carries a URI scheme (e.g. an https:// SEC EDGAR URL), in which case
-# it is used as-is.
-_input = config.config.require("input_file")
-input_file = _input if "://" in _input else f"s3://{config.bucket_name}/{_input}"
+# SEC data is written by the sec-scraper under a prefix in the shared processor
+# bucket. The orchestrator reads it via --sec-bucket-prefix (bucket/prefix) and
+# resolves the date range from that prefix's manifest.parquet.
+sec_prefix = config.config.get("sec_prefix") or "sec"
+sec_bucket_prefix = f"{config.bucket_name}/{sec_prefix}"
 output_file = f"s3://{config.bucket_name}/{config.app_name}/output/subsidiaries.parquet"
 failure_file = f"s3://{config.bucket_name}/{config.app_name}/failures/failures.json"
 
