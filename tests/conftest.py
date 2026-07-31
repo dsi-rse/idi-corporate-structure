@@ -83,7 +83,7 @@ def pipeline(tmp_path, mock_sec_client, mock_extractor) -> SubsidiaryPipeline:
     """A SubsidiaryPipeline wired with a temp failure/output path and mocked dependencies."""
     config = PipelineConfig(
         failure_file=str(tmp_path / "failures.json"),
-        output_file=str(tmp_path / "subsidiaries.parquet"),
+        output_file=str(tmp_path / "latest.parquet"),
         start_date=datetime.date(2024, 1, 1),
         end_date=datetime.date(2024, 1, 2),
         sec_bucket="test-bucket",

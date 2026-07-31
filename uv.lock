@@ -683,7 +683,7 @@ pulumi = [
 requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.12" },
     { name = "boto3", specifier = ">=1.42.70" },
-    { name = "idi-ftm2j-shared", specifier = ">=0.1.13" },
+    { name = "idi-ftm2j-shared", specifier = ">=0.1.16" },
     { name = "pandas", specifier = ">=3.0.2" },
     { name = "pdfplumber", specifier = ">=0.11" },
     { name = "pip-audit", marker = "extra == 'dev'", specifier = ">=2.10.0" },
@@ -711,18 +711,20 @@ pulumi = [
 
 [[package]]
 name = "idi-ftm2j-shared"
-version = "0.1.13"
+version = "0.1.16"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
+    { name = "pandas" },
+    { name = "pyarrow" },
     { name = "requests" },
     { name = "smart-open", extra = ["s3"] },
     { name = "tqdm" },
     { name = "watchtower" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/37/75/666d7c9ea3b6aa6d803dc2dbbc3a6bf911db39bd2b586a6ff91716ec3774/idi_ftm2j_shared-0.1.13.tar.gz", hash = "sha256:5b7bbb511096108a7e174ec166840b48c51e35a9d2e597c7899b4ca2ea14ffbf", size = 118569, upload-time = "2026-07-17T14:04:51.984Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/01/e4/16194e49c998a1ae8bfc273f51d805b529fdc640aaf2905b547c34f30f8e/idi_ftm2j_shared-0.1.16.tar.gz", hash = "sha256:74d97e0d23f76db1f9dc28747340064b85ad628f7aebc18d0023ddf8b0393cd9", size = 130778, upload-time = "2026-07-27T20:35:19.484Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9e/8c/e53a5ca67b72618234fd599395fcfc660b148bb3a08f8867ff200b1cf305/idi_ftm2j_shared-0.1.13-py3-none-any.whl", hash = "sha256:3a782c41aa0c579b5bdaa43a2fe758c75adc213994918050b054741ad009a3e2", size = 21305, upload-time = "2026-07-17T14:04:50.776Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/4c/17211c8d68f0b604e391c33cf0d51f9ae49ad2a50ea2cf52c06ba9614808/idi_ftm2j_shared-0.1.16-py3-none-any.whl", hash = "sha256:ff2d6ec7253c920b019f69522e2cd3be8a65c21951ec206f61872051ea1ef419", size = 23091, upload-time = "2026-07-27T20:35:18.124Z" },
 ]
 
 [[package]]

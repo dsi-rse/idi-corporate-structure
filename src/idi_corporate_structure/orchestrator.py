@@ -136,9 +136,11 @@ def get_args() -> argparse.Namespace:
 def get_dates(args: argparse.Namespace) -> tuple[datetime.date, datetime.date]:
     """Resolve the start/end date range to scrape from the parsed arguments.
 
-    In ``--daily`` mode, reads the most recent ``filing_date`` from the SEC
-    bucket's manifest and looks back ``args.look_back`` days from there.
-    Otherwise returns the explicit ``--start-date``/``--end-date`` values.
+    In ``--daily`` mode, reads the most recent ``date_scraped`` from the SEC
+    bucket's manifest and looks back ``args.look_back`` days from there. The
+    window is derived from the scraped date so it stays consistent with the
+    ``search_by="scraped_date"`` filter the pipeline uses. Otherwise returns the
+    explicit ``--start-date``/``--end-date`` values.
 
     Args:
         args: Parsed command-line arguments.
@@ -148,15 +150,15 @@ def get_dates(args: argparse.Namespace) -> tuple[datetime.date, datetime.date]:
 
     Raises:
         ValueError: If ``--daily`` mode is used and the manifest has no
-            usable ``filing_date`` values.
+            usable ``date_scraped`` values.
     """
     if not args.daily:
         return args.start_date, args.end_date
 
     manifest_df = pd.read_parquet(f"s3://{args.sec_bucket_prefix}/manifest.parquet")
-    latest = manifest_df["filing_date"].max()
+    latest = manifest_df["date_scraped"].max()
     if pd.isna(latest):
-        raise ValueError("manifest.parquet has no usable filing_date values")
+        raise ValueError("manifest.parquet has no usable date_scraped values")
     end_date = pd.to_datetime(latest).date()
     start_date = end_date - datetime.timedelta(days=args.look_back)
     return start_date, end_date

@@ -19,7 +19,7 @@ services:
       # bucket-name/prefix where the sec-scraper wrote SEC data + manifest.parquet
       - SEC_BUCKET_PREFIX=${SEC_BUCKET_PREFIX:?SEC_BUCKET_PREFIX is required (e.g. my-bucket/sec)}
       - SEC_USER_AGENT=${SEC_USER_AGENT:?SEC_USER_AGENT is required (SEC EDGAR contact string)}
-      - OUTPUT_FILE=${OUTPUT_FILE:-/data/output/subsidiaries.parquet}
+      - OUTPUT_FILE=${OUTPUT_FILE:-/data/output/latest.parquet}
       - FAILURE_FILE=${FAILURE_FILE:-/data/failures/failures.json}
       - RATE_LIMIT=${RATE_LIMIT:-0.2}
       - NUM_WORKERS=${NUM_WORKERS:-10}
