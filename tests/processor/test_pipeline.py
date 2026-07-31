@@ -364,6 +364,19 @@ class TestLoadInput:
         assert pipeline.stats.failed_filings == 1
         assert ("0000320193", "0000320193-24-000123") not in pipeline.failure_registry
 
+    def test_queries_filings_by_scraped_date(self, pipeline, mocker):
+        """load_input must pull filings by scraped_date, not filing_date."""
+        mock_iter = mocker.patch(
+            "idi_corporate_structure.pipeline.iter_filings_by_form_type",
+            return_value=[make_scraped_filing()],
+        )
+        mocker.patch.object(pipeline, "_fetch_company_meta", return_value=CompanyMeta())
+
+        pipeline.load_input()
+
+        assert mock_iter.call_args.kwargs["search_by"] == "scraped_date"
+        assert "include_failures" not in mock_iter.call_args.kwargs
+
     def test_respects_input_sample_size(self, pipeline, mocker):
         mocker.patch.object(pipeline, "_INPUT_SAMPLE_SIZE", 1)
         mocker.patch(

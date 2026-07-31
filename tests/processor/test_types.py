@@ -71,7 +71,7 @@ class TestPipelineConfig:
     def test_valid_config_local_files(self, tmp_path):
         config = PipelineConfig(
             failure_file=str(tmp_path / "failures.json"),
-            output_file=str(tmp_path / "subsidiaries.parquet"),
+            output_file=str(tmp_path / "latest.parquet"),
             start_date=_START_DATE,
             end_date=_END_DATE,
             sec_bucket="test-bucket",
@@ -85,7 +85,7 @@ class TestPipelineConfig:
         failure_file = tmp_path / "nonexistent_dir" / "failures.json"
         PipelineConfig(
             failure_file=str(failure_file),
-            output_file=str(tmp_path / "subsidiaries.parquet"),
+            output_file=str(tmp_path / "latest.parquet"),
             start_date=_START_DATE,
             end_date=_END_DATE,
             sec_bucket="test-bucket",
@@ -94,7 +94,7 @@ class TestPipelineConfig:
         assert failure_file.parent.exists()
 
     def test_creates_output_directory_if_missing(self, tmp_path):
-        output_file = tmp_path / "new_dir" / "subsidiaries.parquet"
+        output_file = tmp_path / "new_dir" / "latest.parquet"
         PipelineConfig(
             failure_file=str(tmp_path / "failures.json"),
             output_file=str(output_file),
@@ -109,19 +109,19 @@ class TestPipelineConfig:
         """S3 paths should not trigger local directory creation."""
         config = PipelineConfig(
             failure_file="s3://my-bucket/failures.json",
-            output_file="s3://my-bucket/subsidiaries.parquet",
+            output_file="s3://my-bucket/latest.parquet",
             start_date=_START_DATE,
             end_date=_END_DATE,
             sec_bucket="test-bucket",
         )
 
-        assert config.output_file == "s3://my-bucket/subsidiaries.parquet"
+        assert config.output_file == "s3://my-bucket/latest.parquet"
         assert not (tmp_path / "my-bucket").exists()
 
     def test_custom_num_workers(self, tmp_path):
         config = PipelineConfig(
             failure_file=str(tmp_path / "failures.json"),
-            output_file=str(tmp_path / "subsidiaries.parquet"),
+            output_file=str(tmp_path / "latest.parquet"),
             start_date=_START_DATE,
             end_date=_END_DATE,
             sec_bucket="test-bucket",

@@ -292,7 +292,7 @@ class SubsidiaryPipeline(Pipeline):
             start_date=self.config.start_date,
             end_date=self.config.end_date,
             bucket=self.config.sec_bucket,
-            include_failures=True,
+            search_by="scraped_date",
         )
 
         if self._INPUT_SAMPLE_SIZE:

@@ -59,7 +59,7 @@ AWS credentials are always required: SEC input is read from S3 (the sec-scraper'
 ```bash
 uv run python3 -m src.idi_corporate_structure.orchestrator \
     --sec-bucket-prefix "my-bucket/sec" \
-    --output-file "/local/output/subsidiaries.parquet" \
+    --output-file "/local/output/latest.parquet" \
     --failure-file "/local/failures/failures.json" \
     --start-date "2026-05-01" \
     --end-date "2026-05-31" \
@@ -122,7 +122,7 @@ The container runs `--daily` mode by default (see `compose.yml`), reading SEC in
 | Variable | Default | Description |
 |---|---|---|
 | `OPENAI_MODEL` | `gpt-4.1-nano` | OpenAI model ID for extraction |
-| `OUTPUT_FILE` | `/data/output/subsidiaries.parquet` | Container-side path for Parquet output |
+| `OUTPUT_FILE` | `/data/output/latest.parquet` | Container-side path for Parquet output |
 | `FAILURE_FILE` | `/data/failures/failures.json` | Container-side path for failures JSON |
 | `RATE_LIMIT` | `0.2` | Seconds between SEC HTTP requests |
 | `NUM_WORKERS` | `10` | Number of concurrent GPT extraction worker threads |
@@ -197,7 +197,7 @@ Everything lives in a single externally-managed S3 bucket (name from SSM). SEC i
     manifest.parquet            ← filing index the orchestrator reads (--sec-bucket-prefix)
     ...                         ← scraped exhibit documents
   {app}/
-    output/subsidiaries.parquet ← output
+    output/latest.parquet ← output
     failures/failures.json      ← permanent failure registry
 ```
 

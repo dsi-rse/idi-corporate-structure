@@ -5,13 +5,13 @@ Each check is independently selectable. Run all checks by default, or pass
 
 Usage:
     uv run python scripts/verify_output.py \
-        --parquet output/subsidiaries.parquet \
+        --parquet output/latest.parquet \
         --failures failures/failures.json \
         --user-agent "Your Name your@email.com"
 
     # Run specific checks only:
     uv run python scripts/verify_output.py \
-        --parquet output/subsidiaries.parquet \
+        --parquet output/latest.parquet \
         --failures failures/failures.json \
         --user-agent "Your Name your@email.com" \
         --checks structural location failures
@@ -517,7 +517,7 @@ def create_args() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--parquet", required=True, help="Path to subsidiaries.parquet")
+    parser.add_argument("--parquet", required=True, help="Path to latest.parquet")
     parser.add_argument("--failures", required=True, help="Path to failures.json")
     parser.add_argument(
         "--user-agent",
