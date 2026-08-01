@@ -346,7 +346,7 @@ class SubsidiaryPipeline(Pipeline):
                 self._record_failure(
                     (filing.cik, filing.accession_number),
                     FailureType.NO_EXHIBIT_FOUND,
-                    "warning",
+                    "debug",
                     "No exhibit found for filing: %s - %s - %s (%s)",
                     filing.cik,
                     filing.accession_number,
@@ -525,8 +525,9 @@ class SubsidiaryPipeline(Pipeline):
                 extracted = self.stats.increment("extracted_documents")
                 if extracted % self._LOG_EVERY == 0:
                     self.logger.info(
-                        "Extracted %d / %d documents",
+                        "Progress: %d extracted, %d queued, %d total documents",
                         extracted,
+                        self.stats.queued_documents,
                         self._total_documents,
                     )
                 if self.config.checkpoint_every and extracted % self.config.checkpoint_every == 0:

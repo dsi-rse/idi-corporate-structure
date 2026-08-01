@@ -524,7 +524,7 @@ class GptExtractor(Extractor):
         for sub in subsidiaries:
             name = sub.get("name", "")
             if not _is_name_grounded(name, doc_text_normalized, doc_text_compact):
-                self._logger.warning("Dropped %r from %s (name not in document)", name, doc_url)
+                self._logger.debug("Dropped %r from %s (name not in document)", name, doc_url)
                 ungrounded_name += 1
                 continue
 
@@ -538,7 +538,7 @@ class GptExtractor(Extractor):
             grounded_subsidiaries.append(sub)
 
         if ungrounded_name:
-            self._logger.warning(
+            self._logger.debug(
                 "Dropped %d ungrounded subsidiaries from %s", ungrounded_name, doc_url
             )
 

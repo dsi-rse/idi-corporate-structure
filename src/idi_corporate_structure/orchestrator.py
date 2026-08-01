@@ -128,6 +128,11 @@ def get_args() -> argparse.Namespace:
         help="Flush extracted results to the output file every N documents (0 disables)",
     )
     parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable DEBUG-level logging (per-filing 'no exhibit' and grounding-drop detail)",
+    )
+    parser.add_argument(
         "--look-back",
         type=int,
         default=None,
@@ -174,6 +179,12 @@ def main() -> None:
     """Main function to run the pipeline orchestrator."""
     start = datetime.datetime.now()
     args = get_args()
+
+    # Set before any logger is created: get_logger reads LOG_LEVEL from the
+    # environment and applies it to every logger (orchestrator, pipeline,
+    # extractor), so --verbose flips them all to DEBUG in one place.
+    if args.verbose:
+        os.environ["LOG_LEVEL"] = "DEBUG"
 
     logger = get_logger("orchestrator")
     for key, value in vars(args).items():
