@@ -38,6 +38,7 @@ cpu = config.config.get("cpu") or "1024"
 memory = config.config.get("memory") or "4096"
 rate_limit = config.config.get("rate_limit") or "0.2"
 num_workers = config.config.get("num_workers") or "10"
+checkpoint_every = config.config.get("checkpoint_every") or "500"
 input_sample_size = config.config.get("input_sample_size") or "0"
 openai_model = config.config.get("openai_model") or "gpt-4.1-nano"
 

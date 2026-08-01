@@ -172,6 +172,13 @@ class SubsidiaryPipeline(Pipeline):
             flush_every=config.failure_flush_every,
         )
         self._results_lock = threading.Lock()
+        # Serializes checkpoint writes; acquired non-blocking so a checkpoint
+        # milestone hit while another checkpoint is in flight is skipped rather
+        # than queued behind it.
+        self._checkpoint_lock = threading.Lock()
+        # Total exhibit documents to extract, known once load_input has selected
+        # exhibits for every filing. Used as the fixed denominator in progress logs.
+        self._total_documents = 0
         self.rows = []
         self._company_meta_cache: dict[str, CompanyMeta] = {}
 
@@ -351,6 +358,13 @@ class SubsidiaryPipeline(Pipeline):
 
             filings.append(filing)
 
+        self._total_documents = sum(len(f.exhibit_documents) for f in filings)
+        self.logger.info(
+            "Prepared %d exhibit documents to extract across %d filings",
+            self._total_documents,
+            len(filings),
+        )
+
         return filings
 
     def _record_failure(
@@ -508,13 +522,15 @@ class SubsidiaryPipeline(Pipeline):
 
             finally:
                 work_queue.task_done()
-                self.stats.increment("extracted_documents")
-                if self.stats.extracted_documents % self._LOG_EVERY == 0:
+                extracted = self.stats.increment("extracted_documents")
+                if extracted % self._LOG_EVERY == 0:
                     self.logger.info(
                         "Extracted %d / %d documents",
-                        self.stats.extracted_documents,
-                        self.stats.queued_documents,
+                        extracted,
+                        self._total_documents,
                     )
+                if self.config.checkpoint_every and extracted % self.config.checkpoint_every == 0:
+                    self._checkpoint_results(subsidiaries)
 
     def _extract_pdf_text(self, raw_content: bytes, doc_url: str, filing: Filing) -> str:
         """Extract plain text from a PDF exhibit using pdfplumber.
@@ -660,6 +676,42 @@ class SubsidiaryPipeline(Pipeline):
         work_queue.join()
 
         return subsidiaries
+
+    def _checkpoint_results(self, subsidiaries: list[Subsidiary]) -> None:
+        """Persist extracted results mid-run so an interrupted run is resumable.
+
+        Snapshots the shared results list and merges it into the output parquet
+        via :meth:`save_output`, so a run that is stopped (cost control, spot
+        reclaim, crash) can resume without re-extracting — and re-paying for —
+        documents already processed: :meth:`_load_processed_accessions` reads the
+        checkpointed accessions and :meth:`_should_skip` filters them out.
+
+        Called from extraction worker threads. The checkpoint lock is acquired
+        non-blocking, so if a checkpoint is already running (or the same
+        milestone is hit concurrently) this call is skipped rather than queued —
+        the next milestone will persist any results missed here, and the final
+        :meth:`save_output` in :meth:`run` always writes the remainder.
+
+        Args:
+            subsidiaries: Shared results list, guarded by ``self._results_lock``.
+
+        Returns:
+            None
+        """
+        if not self._checkpoint_lock.acquire(blocking=False):
+            return
+        try:
+            with self._results_lock:
+                snapshot = list(subsidiaries)
+            self.logger.info(
+                "Checkpointing %d subsidiaries at %d / %d documents",
+                len(snapshot),
+                self.stats.extracted_documents,
+                self._total_documents,
+            )
+            self.save_output(snapshot)
+        finally:
+            self._checkpoint_lock.release()
 
     def save_output(self, processed_list: list[Subsidiary]) -> None:
         """Deduplicate and persist extracted subsidiaries as a Parquet file.

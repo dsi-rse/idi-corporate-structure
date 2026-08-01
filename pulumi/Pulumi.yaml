@@ -38,6 +38,10 @@ config:
     description: Number of GPT extraction worker threads
     default: "10"
 
+  idi:checkpoint_every:
+    description: Flush extracted results to the output file every N documents (0 disables)
+    default: "500"
+
   idi:input_sample_size:
     description: Number of filings to process (0 = all, >0 for testing)
     default: "0"

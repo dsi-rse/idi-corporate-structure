@@ -111,6 +111,8 @@ def _container_override_input() -> str:
         ecs.rate_limit,
         "--num-workers",
         ecs.num_workers,
+        "--checkpoint-every",
+        ecs.checkpoint_every,
         "--model",
         ecs.openai_model,
     ]

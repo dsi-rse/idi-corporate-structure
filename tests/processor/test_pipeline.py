@@ -302,6 +302,21 @@ class TestLoadInput:
         assert filings[0].cik == "0000320193"
         assert len(filings[0].exhibit_documents) == 1
 
+    def test_sets_total_documents_from_selected_exhibits(self, pipeline, mocker):
+        mocker.patch(
+            "idi_corporate_structure.pipeline.iter_filings_by_form_type",
+            return_value=[
+                make_scraped_filing(),
+                make_scraped_filing(accession_number="0000320193-24-000999"),
+            ],
+        )
+        mocker.patch.object(pipeline, "_fetch_company_meta", return_value=CompanyMeta())
+
+        filings = pipeline.load_input()
+
+        assert pipeline._total_documents == sum(len(f.exhibit_documents) for f in filings)
+        assert pipeline._total_documents == 2
+
     def test_increments_total_filing_per_scraped_filing(self, pipeline, mocker):
         mocker.patch(
             "idi_corporate_structure.pipeline.iter_filings_by_form_type",
@@ -670,6 +685,56 @@ class TestExtractWorker:
         work_queue.join()
 
         assert pipeline.stats.extracted_documents == 1
+
+    def test_checkpoints_at_configured_cadence(self, pipeline, sample_filing, mocker):
+        pipeline.config.checkpoint_every = 1
+        checkpointed = threading.Event()
+        spy = mocker.patch.object(
+            pipeline, "_checkpoint_results", side_effect=lambda *_: checkpointed.set()
+        )
+        work_queue, subsidiaries = queue.Queue(), []
+        self._start_worker(pipeline, work_queue, subsidiaries)
+
+        work_queue.put((sample_filing, make_exhibit_response()))
+
+        assert checkpointed.wait(timeout=2)
+        spy.assert_called_with(subsidiaries)
+
+    def test_does_not_checkpoint_when_disabled(self, pipeline, sample_filing, mocker):
+        pipeline.config.checkpoint_every = 0
+        spy = mocker.patch.object(pipeline, "_checkpoint_results")
+        work_queue, subsidiaries = queue.Queue(), []
+        self._start_worker(pipeline, work_queue, subsidiaries)
+
+        work_queue.put((sample_filing, make_exhibit_response()))
+        work_queue.join()
+
+        spy.assert_not_called()
+
+
+# ── _checkpoint_results ───────────────────────────────────────────────────────
+
+
+class TestCheckpointResults:
+    """Tests for SubsidiaryPipeline._checkpoint_results()."""
+
+    def test_writes_snapshot_to_output_file(self, pipeline):
+        pipeline._checkpoint_results([make_subsidiary()])
+
+        df = pd.read_parquet(pipeline.config.output_file)
+        assert len(df) == 1
+
+    def test_skips_when_checkpoint_already_in_progress(self, pipeline, mocker):
+        save = mocker.patch.object(pipeline, "save_output")
+        # Simulate an in-flight checkpoint holding the lock: the non-blocking
+        # acquire must fail and the call must return without writing.
+        pipeline._checkpoint_lock.acquire()
+        try:
+            pipeline._checkpoint_results([make_subsidiary()])
+        finally:
+            pipeline._checkpoint_lock.release()
+
+        save.assert_not_called()
 
 
 # ── _extract_pdf_text ─────────────────────────────────────────────────────────
