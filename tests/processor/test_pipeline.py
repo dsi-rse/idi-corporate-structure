@@ -317,6 +317,20 @@ class TestLoadInput:
         assert pipeline._total_documents == sum(len(f.exhibit_documents) for f in filings)
         assert pipeline._total_documents == 2
 
+    def test_logs_scan_progress_at_cadence(self, pipeline, mocker):
+        pipeline._LOAD_LOG_EVERY = 1
+        mocker.patch(
+            "idi_corporate_structure.pipeline.iter_filings_by_form_type",
+            return_value=[make_scraped_filing(), make_scraped_filing(accession_number="ACC2")],
+        )
+        mocker.patch.object(pipeline, "_fetch_company_meta", return_value=CompanyMeta())
+        info_spy = mocker.spy(pipeline.logger, "info")
+
+        pipeline.load_input()
+
+        scan_logs = [c for c in info_spy.call_args_list if "Scanned" in c.args[0]]
+        assert len(scan_logs) == 2
+
     def test_increments_total_filing_per_scraped_filing(self, pipeline, mocker):
         mocker.patch(
             "idi_corporate_structure.pipeline.iter_filings_by_form_type",

@@ -153,6 +153,9 @@ class SubsidiaryPipeline(Pipeline):
     CIK_JSON_URL = "https://data.sec.gov/submissions"
     _INPUT_SAMPLE_SIZE = int(os.environ.get("INPUT_SAMPLE_SIZE", 0))
     _LOG_EVERY = 5
+    # Coarser cadence for the input scan: it sweeps every candidate filing
+    # (~100k for a full historical range), far more than the documents extracted.
+    _LOAD_LOG_EVERY = 1000
     # Enqueued after all extraction tasks to tell the single results worker to
     # finish draining and exit.
     _RESULTS_SENTINEL = object()
@@ -304,7 +307,11 @@ class SubsidiaryPipeline(Pipeline):
 
         filings = []
         for scraped_filing in scraped_filings:
-            self.stats.increment("total_filing")
+            scanned = self.stats.increment("total_filing")
+            if scanned % self._LOAD_LOG_EVERY == 0:
+                self.logger.info(
+                    "Scanned %d filings (%d with exhibits so far)", scanned, len(filings)
+                )
 
             try:
                 company_meta = self._fetch_company_meta(scraped_filing.cik)
