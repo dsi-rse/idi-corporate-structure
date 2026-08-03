@@ -190,8 +190,10 @@ class GptExtractor(Extractor):
         input_rows = self._chunk_input_rows(chunk)
         output_rows = len(chunk_subs)
         yield_ratio = self._chunk_yield(chunk, chunk_subs)
-        log = self._logger.warning if yield_ratio < self._LOW_YIELD_RATIO else self._logger.info
-        log(
+        # Per-chunk detail — DEBUG so it stays out of the default run log; recover
+        # with --verbose. Low yield is still surfaced via the sibling-outlier
+        # re-extraction path and the aggregate stats.
+        self._logger.debug(
             "%s chunk %d/%d: %d input rows → %d extracted (yield=%.2f) @ %s",
             company_name,
             i,
@@ -285,7 +287,7 @@ class GptExtractor(Extractor):
             if not is_outlier:
                 continue
 
-            self._logger.warning(
+            self._logger.debug(
                 "%s chunk %d/%d yield %.2f is a sharp outlier (sibling median %.2f) - "
                 "re-extracting @ %s",
                 company_name,
@@ -296,7 +298,7 @@ class GptExtractor(Extractor):
                 doc_url,
             )
             merged = dedup_by_name(subs + self._reextract_outlier(chunk))
-            self._logger.info(
+            self._logger.debug(
                 "%s chunk %d/%d retry: %d → %d rows after merge @ %s",
                 company_name,
                 i + 1,

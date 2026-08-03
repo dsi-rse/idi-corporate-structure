@@ -688,9 +688,10 @@ class TestExtractWithChunking:
 class TestPerChunkYieldLogging:
     """Per-chunk ``input rows → extracted`` logging in _summarize_chunks.
 
-    The yield ratio is our cheapest signal for catching laziness regressions:
-    if a chunk has 116 rows and the model returns 70, that's a 0.60 yield and
-    deserves a WARNING in the run log.
+    The yield ratio is our cheapest signal for catching laziness regressions,
+    but per-chunk detail is high-volume, so it is logged at DEBUG (recoverable
+    with --verbose) rather than polluting the default run log. Low yield is still
+    surfaced through the sibling-outlier re-extraction path and aggregate stats.
     """
 
     def _build_chunked_doc(self, paragraphs: int = 300) -> dict:
@@ -701,10 +702,10 @@ class TestPerChunkYieldLogging:
             )
         )
 
-    def test_yield_log_emitted_per_chunk(self, sample_filing, mocker):
-        """One yield log line per chunk, at INFO level when yield is healthy."""
+    def test_yield_log_emitted_per_chunk_at_debug(self, sample_filing, mocker):
+        """One yield log line per chunk, at DEBUG level."""
         extractor = GptExtractor(openai_api_key="fake-key")
-        info_spy = mocker.spy(extractor._logger, "info")
+        debug_spy = mocker.spy(extractor._logger, "debug")
         mocker.patch.object(
             extractor,
             "_summarize",
@@ -722,13 +723,14 @@ class TestPerChunkYieldLogging:
 
         _, _, _, num_chunks = extractor.extract(sample_filing, self._build_chunked_doc())
 
-        yield_calls = [c for c in info_spy.call_args_list if "input rows" in c.args[0]]
+        yield_calls = [c for c in debug_spy.call_args_list if "input rows" in c.args[0]]
         assert len(yield_calls) == num_chunks
         assert all("yield=" in c.args[0] for c in yield_calls)
 
-    def test_low_yield_emits_warning(self, sample_filing, mocker):
-        """Chunk yield below _LOW_YIELD_RATIO is logged as a WARNING."""
+    def test_low_yield_logged_at_debug_not_warning(self, sample_filing, mocker):
+        """A low-yield chunk logs at DEBUG, not WARNING — it stays out of the default log."""
         extractor = GptExtractor(openai_api_key="fake-key")
+        debug_spy = mocker.spy(extractor._logger, "debug")
         warning_spy = mocker.spy(extractor._logger, "warning")
         mocker.patch.object(
             extractor,
@@ -746,33 +748,8 @@ class TestPerChunkYieldLogging:
 
         extractor.extract(sample_filing, self._build_chunked_doc())
 
-        yield_warnings = [c for c in warning_spy.call_args_list if "input rows" in c.args[0]]
-        assert yield_warnings, "low-yield chunk should produce a WARNING-level yield log"
-
-    def test_healthy_yield_does_not_warn(self, sample_filing, mocker):
-        """High-yield chunks do not emit WARNING-level yield logs."""
-        extractor = GptExtractor(openai_api_key="fake-key")
-        warning_spy = mocker.spy(extractor._logger, "warning")
-
-        def echo(doc):
-            rows = [p for p in doc.split("\n\n") if p.strip()]
-            return {
-                "subsidiaries": [
-                    {
-                        "name": p.split(" (")[0],
-                        "location": "Delaware",
-                        "source_quote": p,
-                    }
-                    for p in rows
-                ]
-            }
-
-        mocker.patch.object(extractor, "_summarize", side_effect=echo)
-
-        extractor.extract(sample_filing, self._build_chunked_doc())
-
-        yield_warnings = [c for c in warning_spy.call_args_list if "input rows" in c.args[0]]
-        assert not yield_warnings, "healthy-yield chunks should not warn"
+        assert [c for c in debug_spy.call_args_list if "input rows" in c.args[0]]
+        assert not [c for c in warning_spy.call_args_list if "input rows" in c.args[0]]
 
 
 class TestRetryOutlierChunks:

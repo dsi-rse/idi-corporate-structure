@@ -364,9 +364,10 @@ class SubsidiaryPipeline(Pipeline):
 
         self._total_documents = sum(len(f.exhibit_documents) for f in filings)
         self.logger.info(
-            "Prepared %d exhibit documents to extract across %d filings",
-            self._total_documents,
+            "Scan complete: %d filings scanned, %d with exhibits, %d documents to extract",
+            self.stats.total_filing,
             len(filings),
+            self._total_documents,
         )
 
         return filings
