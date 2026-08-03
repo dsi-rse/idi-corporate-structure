@@ -522,38 +522,38 @@ class TestReportExtraction:
 class TestExtractWorker:
     """Tests for SubsidiaryPipeline._extract_worker()."""
 
-    def _start_worker(self, pipeline, work_queue, subsidiaries):
+    def _start_worker(self, pipeline, work_queue, results_queue):
         threading.Thread(
             target=pipeline._extract_worker,
-            args=(work_queue, subsidiaries),
+            args=(work_queue, results_queue),
             daemon=True,
         ).start()
 
     def test_calls_extractor_with_filing_and_contents(self, pipeline, sample_filing):
         exhibit = make_exhibit_response()
-        work_queue, subsidiaries = queue.Queue(), []
-        self._start_worker(pipeline, work_queue, subsidiaries)
+        work_queue, results_queue = queue.Queue(), queue.Queue()
+        self._start_worker(pipeline, work_queue, results_queue)
 
         work_queue.put((sample_filing, exhibit))
         work_queue.join()
 
         pipeline.extractor.extract.assert_called_once_with(sample_filing, exhibit)
 
-    def test_appends_batch_to_subsidiaries_list(self, pipeline, sample_filing):
+    def test_posts_batch_to_results_queue(self, pipeline, sample_filing):
         subsidiary = make_subsidiary(parent_cik=sample_filing.cik)
         pipeline.extractor.extract.return_value = ([subsidiary], 0, 0, 1)
 
-        work_queue, subsidiaries = queue.Queue(), []
-        self._start_worker(pipeline, work_queue, subsidiaries)
+        work_queue, results_queue = queue.Queue(), queue.Queue()
+        self._start_worker(pipeline, work_queue, results_queue)
 
         work_queue.put((sample_filing, make_exhibit_response()))
         work_queue.join()
 
-        assert subsidiaries == [subsidiary]
+        assert results_queue.get_nowait() == [subsidiary]
 
     def test_marks_work_task_done_on_success(self, pipeline, sample_filing):
-        work_queue, subsidiaries = queue.Queue(), []
-        self._start_worker(pipeline, work_queue, subsidiaries)
+        work_queue, results_queue = queue.Queue(), queue.Queue()
+        self._start_worker(pipeline, work_queue, results_queue)
 
         work_queue.put((sample_filing, make_exhibit_response()))
         work_queue.join()  # completes only if task_done() was called
@@ -561,8 +561,8 @@ class TestExtractWorker:
     def test_marks_work_task_done_on_exception(self, pipeline, sample_filing):
         pipeline.extractor.extract.side_effect = RuntimeError("GPT error")
 
-        work_queue, subsidiaries = queue.Queue(), []
-        self._start_worker(pipeline, work_queue, subsidiaries)
+        work_queue, results_queue = queue.Queue(), queue.Queue()
+        self._start_worker(pipeline, work_queue, results_queue)
 
         work_queue.put((sample_filing, make_exhibit_response()))
         work_queue.join()  # completes only if task_done() is called in finally
@@ -570,8 +570,8 @@ class TestExtractWorker:
     def test_increments_failed_subsidiaries_on_exception(self, pipeline, sample_filing):
         pipeline.extractor.extract.side_effect = RuntimeError("GPT error")
 
-        work_queue, subsidiaries = queue.Queue(), []
-        self._start_worker(pipeline, work_queue, subsidiaries)
+        work_queue, results_queue = queue.Queue(), queue.Queue()
+        self._start_worker(pipeline, work_queue, results_queue)
 
         work_queue.put((sample_filing, make_exhibit_response()))
         work_queue.join()
@@ -582,8 +582,8 @@ class TestExtractWorker:
         pipeline.extractor.extract.side_effect = RuntimeError("GPT error")
         spy = mocker.spy(pipeline.failure_registry, "add")
 
-        work_queue, subsidiaries = queue.Queue(), []
-        self._start_worker(pipeline, work_queue, subsidiaries)
+        work_queue, results_queue = queue.Queue(), queue.Queue()
+        self._start_worker(pipeline, work_queue, results_queue)
 
         work_queue.put((sample_filing, make_exhibit_response()))
         work_queue.join()
@@ -600,8 +600,8 @@ class TestExtractWorker:
         exception_spy = mocker.spy(pipeline.logger, "exception")
         exhibit = make_exhibit_response()
 
-        work_queue, subsidiaries = queue.Queue(), []
-        self._start_worker(pipeline, work_queue, subsidiaries)
+        work_queue, results_queue = queue.Queue(), queue.Queue()
+        self._start_worker(pipeline, work_queue, results_queue)
 
         work_queue.put((sample_filing, exhibit))
         work_queue.join()
@@ -615,8 +615,8 @@ class TestExtractWorker:
         pipeline.extractor.extract.side_effect = DocumentError("too long")
         spy = mocker.spy(pipeline.failure_registry, "add")
 
-        work_queue, subsidiaries = queue.Queue(), []
-        self._start_worker(pipeline, work_queue, subsidiaries)
+        work_queue, results_queue = queue.Queue(), queue.Queue()
+        self._start_worker(pipeline, work_queue, results_queue)
 
         work_queue.put((sample_filing, make_exhibit_response()))
         work_queue.join()
@@ -628,8 +628,8 @@ class TestExtractWorker:
     def test_timeout_error_increments_timeout_and_failed(self, pipeline, sample_filing):
         pipeline.extractor.extract.side_effect = ExtractionTimeoutError("timed out")
 
-        work_queue, subsidiaries = queue.Queue(), []
-        self._start_worker(pipeline, work_queue, subsidiaries)
+        work_queue, results_queue = queue.Queue(), queue.Queue()
+        self._start_worker(pipeline, work_queue, results_queue)
 
         work_queue.put((sample_filing, make_exhibit_response()))
         work_queue.join()
@@ -640,8 +640,8 @@ class TestExtractWorker:
     def test_chunked_extraction_increments_stat(self, pipeline, sample_filing):
         pipeline.extractor.extract.return_value = ([], 0, 0, 5)  # 5 chunks
 
-        work_queue, subsidiaries = queue.Queue(), []
-        self._start_worker(pipeline, work_queue, subsidiaries)
+        work_queue, results_queue = queue.Queue(), queue.Queue()
+        self._start_worker(pipeline, work_queue, results_queue)
 
         work_queue.put((sample_filing, make_exhibit_response()))
         work_queue.join()
@@ -651,8 +651,8 @@ class TestExtractWorker:
     def test_one_shot_does_not_increment_chunked(self, pipeline, sample_filing):
         pipeline.extractor.extract.return_value = ([], 0, 0, 1)  # single chunk
 
-        work_queue, subsidiaries = queue.Queue(), []
-        self._start_worker(pipeline, work_queue, subsidiaries)
+        work_queue, results_queue = queue.Queue(), queue.Queue()
+        self._start_worker(pipeline, work_queue, results_queue)
 
         work_queue.put((sample_filing, make_exhibit_response()))
         work_queue.join()
@@ -665,8 +665,8 @@ class TestExtractWorker:
         pipeline.extractor.extract.side_effect = ExtractionTruncatedError("output cut off")
         spy = mocker.spy(pipeline.failure_registry, "add")
 
-        work_queue, subsidiaries = queue.Queue(), []
-        self._start_worker(pipeline, work_queue, subsidiaries)
+        work_queue, results_queue = queue.Queue(), queue.Queue()
+        self._start_worker(pipeline, work_queue, results_queue)
 
         work_queue.put((sample_filing, make_exhibit_response()))
         work_queue.join()
@@ -677,64 +677,84 @@ class TestExtractWorker:
             (sample_filing.cik, sample_filing.accession_number), FailureType.TRUNCATED_ERROR
         )
 
-    def test_increments_extracted_documents_per_item(self, pipeline, sample_filing):
-        work_queue, subsidiaries = queue.Queue(), []
-        self._start_worker(pipeline, work_queue, subsidiaries)
+    def test_posts_empty_batch_on_failure(self, pipeline, sample_filing):
+        """A failed document still posts a batch (empty) so the consumer counts it."""
+        pipeline.extractor.extract.side_effect = RuntimeError("GPT error")
+
+        work_queue, results_queue = queue.Queue(), queue.Queue()
+        self._start_worker(pipeline, work_queue, results_queue)
 
         work_queue.put((sample_filing, make_exhibit_response()))
         work_queue.join()
 
-        assert pipeline.stats.extracted_documents == 1
+        assert results_queue.get_nowait() == []
 
-    def test_checkpoints_at_configured_cadence(self, pipeline, sample_filing, mocker):
-        pipeline.config.checkpoint_every = 1
-        checkpointed = threading.Event()
-        spy = mocker.patch.object(
-            pipeline, "_checkpoint_results", side_effect=lambda *_: checkpointed.set()
-        )
-        work_queue, subsidiaries = queue.Queue(), []
-        self._start_worker(pipeline, work_queue, subsidiaries)
 
-        work_queue.put((sample_filing, make_exhibit_response()))
+# ── _results_worker ───────────────────────────────────────────────────────────
 
-        assert checkpointed.wait(timeout=2)
-        spy.assert_called_with(subsidiaries)
 
-    def test_does_not_checkpoint_when_disabled(self, pipeline, sample_filing, mocker):
+class TestResultsWorker:
+    """Tests for SubsidiaryPipeline._results_worker()."""
+
+    def _drain(self, pipeline, batches):
+        """Run the results worker synchronously over batches, then a sentinel."""
+        results_queue = queue.Queue()
+        subsidiaries: list = []
+        for batch in batches:
+            results_queue.put(batch)
+        results_queue.put(pipeline._RESULTS_SENTINEL)
+        pipeline._results_worker(results_queue, subsidiaries)  # returns at the sentinel
+        return subsidiaries
+
+    def test_extends_buffer_with_batches(self, pipeline):
+        sub = make_subsidiary()
+        subsidiaries = self._drain(pipeline, [[sub], []])
+
+        assert subsidiaries == [sub]
+
+    def test_counts_every_document(self, pipeline):
+        self._drain(pipeline, [[make_subsidiary()], [], [make_subsidiary()]])
+
+        assert pipeline.stats.extracted_documents == 3
+
+    def test_sentinel_stops_worker(self, pipeline):
+        # Returns only because the sentinel is consumed; nothing else enqueued.
+        assert self._drain(pipeline, []) == []
+
+    def test_checkpoints_at_configured_cadence(self, pipeline, mocker):
+        pipeline.config.checkpoint_every = 2
+        spy = mocker.patch.object(pipeline, "_checkpoint")
+
+        self._drain(pipeline, [[], [], [], []])  # milestones at 2 and 4 documents
+
+        assert spy.call_count == 2
+
+    def test_does_not_checkpoint_when_disabled(self, pipeline, mocker):
         pipeline.config.checkpoint_every = 0
-        spy = mocker.patch.object(pipeline, "_checkpoint_results")
-        work_queue, subsidiaries = queue.Queue(), []
-        self._start_worker(pipeline, work_queue, subsidiaries)
+        spy = mocker.patch.object(pipeline, "_checkpoint")
 
-        work_queue.put((sample_filing, make_exhibit_response()))
-        work_queue.join()
+        self._drain(pipeline, [[make_subsidiary()], []])
 
         spy.assert_not_called()
 
 
-# ── _checkpoint_results ───────────────────────────────────────────────────────
+# ── _checkpoint ───────────────────────────────────────────────────────────────
 
 
-class TestCheckpointResults:
-    """Tests for SubsidiaryPipeline._checkpoint_results()."""
+class TestCheckpoint:
+    """Tests for SubsidiaryPipeline._checkpoint()."""
 
-    def test_writes_snapshot_to_output_file(self, pipeline):
-        pipeline._checkpoint_results([make_subsidiary()])
+    def test_writes_results_to_output_file(self, pipeline):
+        pipeline._checkpoint([make_subsidiary()], extracted=1)
 
         df = pd.read_parquet(pipeline.config.output_file)
         assert len(df) == 1
 
-    def test_skips_when_checkpoint_already_in_progress(self, pipeline, mocker):
-        save = mocker.patch.object(pipeline, "save_output")
-        # Simulate an in-flight checkpoint holding the lock: the non-blocking
-        # acquire must fail and the call must return without writing.
-        pipeline._checkpoint_lock.acquire()
-        try:
-            pipeline._checkpoint_results([make_subsidiary()])
-        finally:
-            pipeline._checkpoint_lock.release()
+    def test_swallows_write_errors(self, pipeline, mocker):
+        """A failed checkpoint must not propagate — the run continues to the final save."""
+        mocker.patch.object(pipeline, "save_output", side_effect=RuntimeError("s3 down"))
 
-        save.assert_not_called()
+        pipeline._checkpoint([make_subsidiary()], extracted=1)  # must not raise
 
 
 # ── _extract_pdf_text ─────────────────────────────────────────────────────────

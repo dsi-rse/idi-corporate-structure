@@ -153,6 +153,9 @@ class SubsidiaryPipeline(Pipeline):
     CIK_JSON_URL = "https://data.sec.gov/submissions"
     _INPUT_SAMPLE_SIZE = int(os.environ.get("INPUT_SAMPLE_SIZE", 0))
     _LOG_EVERY = 5
+    # Enqueued after all extraction tasks to tell the single results worker to
+    # finish draining and exit.
+    _RESULTS_SENTINEL = object()
 
     def __init__(
         self, config: PipelineConfig, sec_client: SecClient, extractor: GptExtractor
@@ -171,15 +174,9 @@ class SubsidiaryPipeline(Pipeline):
             classifier=CorporateStructureFailureClassifier(),
             flush_every=config.failure_flush_every,
         )
-        self._results_lock = threading.Lock()
-        # Serializes checkpoint writes; acquired non-blocking so a checkpoint
-        # milestone hit while another checkpoint is in flight is skipped rather
-        # than queued behind it.
-        self._checkpoint_lock = threading.Lock()
         # Total exhibit documents to extract, known once load_input has selected
         # exhibits for every filing. Used as the fixed denominator in progress logs.
         self._total_documents = 0
-        self.rows = []
         self._company_meta_cache: dict[str, CompanyMeta] = {}
 
     def _load_processed_accessions(self) -> set[str]:
@@ -434,25 +431,31 @@ class SubsidiaryPipeline(Pipeline):
                 stat_keys=("zero_subsidiaries",),
             )
 
-    def _extract_worker(self, work_queue: queue.Queue, subsidiaries: list[Subsidiary]) -> None:
-        """Worker thread that extracts subsidiaries from queued exhibit documents.
+    def _extract_worker(self, work_queue: queue.Queue, results_queue: queue.Queue) -> None:
+        """Producer thread that extracts subsidiaries from queued exhibit documents.
 
         Runs as a daemon thread, consuming ``(filing, exhibit_contents)`` tuples from
-        ``work_queue`` and posting extracted ``list[Subsidiary]`` results to
-        ``results_queue``. Extraction errors are caught, logged, and recorded in the
-        failure registry so the worker loop continues.
+        ``work_queue`` and posting each document's extracted ``list[Subsidiary]``
+        batch to ``results_queue`` for the single results worker to accumulate and
+        persist. Extraction errors are caught, logged, and recorded in the failure
+        registry so the loop continues.
+
+        One item is posted per processed document — an empty list on failure or a
+        zero-subsidiary document — so the results worker can count documents (not
+        just subsidiaries) and keep the ``extracted / total`` progress accurate.
 
         Args:
             work_queue: Queue of ``(Filing, dict)`` tuples to process. Each dict has
                 ``"url"`` and ``"data"`` keys for the exhibit content.
-            subsidiaries: Shared list, guarded by ``self._results_lock``, that
-                extracted ``Subsidiary`` results are appended to.
+            results_queue: Queue each document's ``list[Subsidiary]`` batch is posted
+                to for the results worker to consume.
 
         Returns:
             None
         """
         while True:
             filing, exhibit_contents = work_queue.get()
+            batch: list[Subsidiary] = []
             try:
                 subsidiaries_batch, ungrounded_name, ungrounded_location, num_chunks = (
                     self.extractor.extract(filing, exhibit_contents)
@@ -464,8 +467,7 @@ class SubsidiaryPipeline(Pipeline):
                     num_subsidiaries=len(subsidiaries_batch),
                     filing=filing,
                 )
-                with self._results_lock:
-                    subsidiaries.extend(subsidiaries_batch)
+                batch = subsidiaries_batch
 
             except DocumentError as e:
                 self._record_failure(
@@ -521,17 +523,10 @@ class SubsidiaryPipeline(Pipeline):
                 )
 
             finally:
+                # Post the batch (empty on failure) before marking the task done, so
+                # work_queue.join() implies every batch is already on results_queue.
+                results_queue.put(batch)
                 work_queue.task_done()
-                extracted = self.stats.increment("extracted_documents")
-                if extracted % self._LOG_EVERY == 0:
-                    self.logger.info(
-                        "Progress: %d extracted, %d queued, %d total documents",
-                        extracted,
-                        self.stats.queued_documents,
-                        self._total_documents,
-                    )
-                if self.config.checkpoint_every and extracted % self.config.checkpoint_every == 0:
-                    self._checkpoint_results(subsidiaries)
 
     def _extract_pdf_text(self, raw_content: bytes, doc_url: str, filing: Filing) -> str:
         """Extract plain text from a PDF exhibit using pdfplumber.
@@ -633,31 +628,98 @@ class SubsidiaryPipeline(Pipeline):
 
         return exhibit_content
 
+    def _results_worker(self, results_queue: queue.Queue, subsidiaries: list[Subsidiary]) -> None:
+        """Single consumer that accumulates result batches and checkpoints them.
+
+        Because only this thread mutates ``subsidiaries`` or writes the output file,
+        the progress-log and checkpoint cadences are driven by one race-free counter
+        with no locking. Consumes batches until it receives
+        :attr:`_RESULTS_SENTINEL`, then returns; the final complete write is left to
+        :meth:`save_output` in :meth:`run`, so this worker only writes periodic
+        checkpoints that make an interrupted run resumable (via
+        :meth:`_load_processed_accessions` / :meth:`_should_skip`) without
+        re-extracting — and re-paying for — completed documents.
+
+        Args:
+            results_queue: Queue of ``list[Subsidiary]`` batches (one per processed
+                document), terminated by :attr:`_RESULTS_SENTINEL`.
+            subsidiaries: Results buffer this worker owns and extends in place.
+
+        Returns:
+            None
+        """
+        while True:
+            batch = results_queue.get()
+            try:
+                if batch is self._RESULTS_SENTINEL:
+                    return
+                subsidiaries.extend(batch)
+                extracted = self.stats.increment("extracted_documents")
+                if extracted % self._LOG_EVERY == 0:
+                    self.logger.info(
+                        "Progress: %d extracted, %d queued, %d total documents",
+                        extracted,
+                        self.stats.queued_documents,
+                        self._total_documents,
+                    )
+                if self.config.checkpoint_every and extracted % self.config.checkpoint_every == 0:
+                    self._checkpoint(subsidiaries, extracted)
+            finally:
+                results_queue.task_done()
+
+    def _checkpoint(self, subsidiaries: list[Subsidiary], extracted: int) -> None:
+        """Write a mid-run checkpoint of results so an interrupted run is resumable.
+
+        Called only from the single results worker, so no locking is needed. A failed
+        write is logged and swallowed: the run continues and the final
+        :meth:`save_output` in :meth:`run` still writes the complete set.
+
+        Args:
+            subsidiaries: The results buffer to persist (not mutated during the call —
+                only the calling results worker mutates it).
+            extracted: Documents processed so far, for the log line.
+
+        Returns:
+            None
+        """
+        try:
+            self.logger.info(
+                "Checkpointing %d subsidiaries at %d / %d documents",
+                len(subsidiaries),
+                extracted,
+                self._total_documents,
+            )
+            self.save_output(subsidiaries)
+        except Exception:
+            self.logger.exception("Checkpoint write failed at %d documents; continuing", extracted)
+
     def process(self, input_list: list[Filing]) -> list[Subsidiary]:
         """Fetch exhibit content and extract subsidiaries from each filing.
 
-        Exhibit fetching runs on the main thread; extraction is parallelised
-        across :attr:`~PipelineConfig.num_workers` daemon threads. Progress is
-        logged periodically (every :attr:`_LOG_EVERY` documents) rather than
-        via a live progress bar, since bars don't render correctly in
-        aggregated cloud logs.
+        Exhibit fetching runs on the main thread; extraction is parallelised across
+        :attr:`~PipelineConfig.num_workers` daemon producer threads that post result
+        batches to a queue drained by a single results worker. That consumer owns the
+        results buffer and all output writes, so accumulation, progress logging (every
+        :attr:`_LOG_EVERY` documents), and periodic checkpoints need no locking.
+        Progress is logged periodically rather than via a live progress bar, since
+        bars don't render correctly in aggregated cloud logs.
 
         Args:
             input_list: List of :class:`Filing` objects returned by
                 :meth:`load_input`.
 
         Returns:
-            Deduplicated list of :class:`Subsidiary` objects extracted across all
-            filings.
+            List of :class:`Subsidiary` objects extracted across all filings.
         """
         work_queue = queue.Queue(maxsize=self.config.num_workers * 2)
-        subsidiaries = []
+        results_queue: queue.Queue = queue.Queue()
+        subsidiaries: list[Subsidiary] = []
 
-        # Start extract and results workers
+        # Producers extract in parallel; a single consumer owns the results buffer.
         extract_workers = [
             threading.Thread(
                 target=self._extract_worker,
-                args=(work_queue, subsidiaries),
+                args=(work_queue, results_queue),
                 daemon=True,
                 name=f"extract-worker-{i}",
             )
@@ -666,6 +728,14 @@ class SubsidiaryPipeline(Pipeline):
         for worker in extract_workers:
             worker.start()
 
+        results_worker = threading.Thread(
+            target=self._results_worker,
+            args=(results_queue, subsidiaries),
+            daemon=True,
+            name="results-worker",
+        )
+        results_worker.start()
+
         # SEC operations to fetch exhibit data — one task per document
         for filing in input_list:
             exhibit_contents = self._fetch_exhibit(filing)
@@ -673,46 +743,14 @@ class SubsidiaryPipeline(Pipeline):
                 work_queue.put((filing, exhibit_content))
                 self.stats.increment("queued_documents")
 
-        # Wait for all extraction to complete
+        # Every producer posts its batch before task_done, so once work_queue drains
+        # all batches are on results_queue. Signal end-of-stream and let the consumer
+        # finish; run() performs the final, complete save_output afterwards.
         work_queue.join()
+        results_queue.put(self._RESULTS_SENTINEL)
+        results_worker.join()
 
         return subsidiaries
-
-    def _checkpoint_results(self, subsidiaries: list[Subsidiary]) -> None:
-        """Persist extracted results mid-run so an interrupted run is resumable.
-
-        Snapshots the shared results list and merges it into the output parquet
-        via :meth:`save_output`, so a run that is stopped (cost control, spot
-        reclaim, crash) can resume without re-extracting — and re-paying for —
-        documents already processed: :meth:`_load_processed_accessions` reads the
-        checkpointed accessions and :meth:`_should_skip` filters them out.
-
-        Called from extraction worker threads. The checkpoint lock is acquired
-        non-blocking, so if a checkpoint is already running (or the same
-        milestone is hit concurrently) this call is skipped rather than queued —
-        the next milestone will persist any results missed here, and the final
-        :meth:`save_output` in :meth:`run` always writes the remainder.
-
-        Args:
-            subsidiaries: Shared results list, guarded by ``self._results_lock``.
-
-        Returns:
-            None
-        """
-        if not self._checkpoint_lock.acquire(blocking=False):
-            return
-        try:
-            with self._results_lock:
-                snapshot = list(subsidiaries)
-            self.logger.info(
-                "Checkpointing %d subsidiaries at %d / %d documents",
-                len(snapshot),
-                self.stats.extracted_documents,
-                self._total_documents,
-            )
-            self.save_output(snapshot)
-        finally:
-            self._checkpoint_lock.release()
 
     def save_output(self, processed_list: list[Subsidiary]) -> None:
         """Deduplicate and persist extracted subsidiaries as a Parquet file.
