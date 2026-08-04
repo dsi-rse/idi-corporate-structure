@@ -671,16 +671,24 @@ class SubsidiaryPipeline(Pipeline):
                         self._total_documents,
                     )
                 if self.config.checkpoint_every and extracted % self.config.checkpoint_every == 0:
-                    self._checkpoint(subsidiaries, extracted)
+                    # Drop the flushed rows from memory once they're safely on disk,
+                    # so the buffer stays bounded (~checkpoint_every documents) instead
+                    # of growing to millions of rows over a full run. save_output merges
+                    # with the existing parquet, so cleared rows are not lost; the final
+                    # save in run() re-merges the remaining tail. Keep the buffer if the
+                    # write failed, so its rows retry on the next checkpoint / final save.
+                    if self._checkpoint(subsidiaries, extracted):
+                        subsidiaries.clear()
             finally:
                 results_queue.task_done()
 
-    def _checkpoint(self, subsidiaries: list[Subsidiary], extracted: int) -> None:
+    def _checkpoint(self, subsidiaries: list[Subsidiary], extracted: int) -> bool:
         """Write a mid-run checkpoint of results so an interrupted run is resumable.
 
         Called only from the single results worker, so no locking is needed. A failed
-        write is logged and swallowed: the run continues and the final
-        :meth:`save_output` in :meth:`run` still writes the complete set.
+        write is logged and swallowed (the final :meth:`save_output` in :meth:`run`
+        still writes whatever remains in the buffer), and reported via the return
+        value so the caller can decide whether to drop the flushed rows.
 
         Args:
             subsidiaries: The results buffer to persist (not mutated during the call —
@@ -688,7 +696,7 @@ class SubsidiaryPipeline(Pipeline):
             extracted: Documents processed so far, for the log line.
 
         Returns:
-            None
+            True if the write succeeded (safe to clear the buffer), False otherwise.
         """
         try:
             self.logger.info(
@@ -698,8 +706,12 @@ class SubsidiaryPipeline(Pipeline):
                 self._total_documents,
             )
             self.save_output(subsidiaries)
+            return True
         except Exception:
-            self.logger.exception("Checkpoint write failed at %d documents; continuing", extracted)
+            self.logger.exception(
+                "Checkpoint write failed at %d documents; keeping buffer for retry", extracted
+            )
+            return False
 
     def process(self, input_list: list[Filing]) -> list[Subsidiary]:
         """Fetch exhibit content and extract subsidiaries from each filing.

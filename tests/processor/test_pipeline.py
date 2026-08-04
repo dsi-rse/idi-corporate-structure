@@ -751,6 +751,28 @@ class TestResultsWorker:
 
         spy.assert_not_called()
 
+    def test_clears_buffer_after_successful_checkpoint(self, pipeline):
+        """A successful checkpoint drops the flushed rows from memory (bounded buffer)."""
+        pipeline.config.checkpoint_every = 2
+
+        subsidiaries = self._drain(
+            pipeline, [[make_subsidiary(name="A LLC")], [make_subsidiary(name="B LLC")]]
+        )
+
+        assert subsidiaries == []  # emptied after the flush
+        assert len(pd.read_parquet(pipeline.config.output_file)) == 2  # both persisted
+
+    def test_keeps_buffer_when_checkpoint_fails(self, pipeline, mocker):
+        """A failed checkpoint retains the buffer so the rows retry on the final save."""
+        pipeline.config.checkpoint_every = 2
+        mocker.patch.object(pipeline, "save_output", side_effect=RuntimeError("s3 down"))
+
+        subsidiaries = self._drain(
+            pipeline, [[make_subsidiary(name="A LLC")], [make_subsidiary(name="B LLC")]]
+        )
+
+        assert len(subsidiaries) == 2  # not cleared
+
 
 # ── _checkpoint ───────────────────────────────────────────────────────────────
 
@@ -759,16 +781,16 @@ class TestCheckpoint:
     """Tests for SubsidiaryPipeline._checkpoint()."""
 
     def test_writes_results_to_output_file(self, pipeline):
-        pipeline._checkpoint([make_subsidiary()], extracted=1)
+        assert pipeline._checkpoint([make_subsidiary()], extracted=1) is True
 
         df = pd.read_parquet(pipeline.config.output_file)
         assert len(df) == 1
 
-    def test_swallows_write_errors(self, pipeline, mocker):
-        """A failed checkpoint must not propagate — the run continues to the final save."""
+    def test_swallows_write_errors_and_reports_failure(self, pipeline, mocker):
+        """A failed checkpoint must not propagate and must report failure (keep buffer)."""
         mocker.patch.object(pipeline, "save_output", side_effect=RuntimeError("s3 down"))
 
-        pipeline._checkpoint([make_subsidiary()], extracted=1)  # must not raise
+        assert pipeline._checkpoint([make_subsidiary()], extracted=1) is False  # must not raise
 
 
 # ── _extract_pdf_text ─────────────────────────────────────────────────────────

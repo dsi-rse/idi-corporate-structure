@@ -3,7 +3,7 @@ config:
   idi:sec_prefix: "sec"
   idi:sec_user_agent: "DSI Core Facility dsicorefacility_project8@uchicago.edu"
   idi:cpu: "1024"
-  idi:memory: "4096"
+  idi:memory: "8192"
   idi:rate_limit: "0.2"
   idi:num_workers: "10"
   idi:checkpoint_every: "500"
