@@ -826,7 +826,10 @@ class SubsidiaryPipeline(Pipeline):
             # output file exists yet, the location/parent_state_of_incorporation
             # normalization below would KeyError on a columnless frame. There's
             # nothing new to merge or normalize either way, so skip entirely.
-            self.logger.info("No new subsidiaries extracted; skipping save_output")
+            self.logger.info(
+                "No subsidiaries to write; skipping save_output "
+                "(all results already checkpointed, or none extracted)"
+            )
             return
 
         # Save processed subsidiaries to a DataFrame
