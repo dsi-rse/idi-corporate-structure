@@ -48,8 +48,10 @@ openai_model = config.config.get("openai_model") or "gpt-4.1-nano"
 # resolves the date range from that prefix's manifest.parquet.
 sec_prefix = config.config.get("sec_prefix") or "sec"
 sec_bucket_prefix = f"{config.bucket_name}/{sec_prefix}"
-output_file = f"s3://{config.bucket_name}/{config.app_name}/output/latest.parquet"
-failure_file = f"s3://{config.bucket_name}/{config.app_name}/failures/failures.json"
+# Processor outputs live under a shared "processors/<app>/" prefix in the bucket.
+output_prefix = f"s3://{config.bucket_name}/processors/{config.app_name}"
+output_file = f"{output_prefix}/output/latest.parquet"
+failure_file = f"{output_prefix}/failures/failures.json"
 
 # Container definition as JSON (required by aws.ecs.TaskDefinition)
 container_definitions = pulumi.Output.all(
