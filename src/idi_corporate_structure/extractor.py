@@ -64,19 +64,13 @@ _MIN_SUBSEQUENCE_TOKENS = 2  # single-token names use strict/compact only
 class DocumentError(Exception):
     """Exception raised for document-specific errors."""
 
-    pass
-
 
 class ExtractionTimeoutError(RuntimeError):
     """Exception raised when the OpenAI API times out during extraction."""
 
-    pass
-
 
 class ExtractionTruncatedError(RuntimeError):
     """Raised when the model's extraction response was cut off by the output token limit."""
-
-    pass
 
 
 class Extractor(ABC):

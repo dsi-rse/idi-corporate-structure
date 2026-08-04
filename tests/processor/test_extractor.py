@@ -883,7 +883,7 @@ class TestWindowedSubsequenceGrounding:
         from idi_corporate_structure.extractor import _is_name_in_document
 
         # Name cell wrapped across rows, interleaved with the row's other columns.
-        doc = "PT Telekomunikasi ​ Mobile ​ 1995 ​ 70 ​ 70 selular ​ telecommunication"
+        doc = "PT Telekomunikasi \u200b Mobile \u200b 1995 \u200b 70 \u200b 70 selular \u200b telecommunication"
         assert _is_name_in_document("PT Telekomunikasi Selular", doc)
 
     def test_rejects_tokens_scattered_beyond_window(self):
@@ -912,7 +912,7 @@ class TestWindowedSubsequenceGrounding:
         from idi_corporate_structure import extractor as ext_mod
 
         mock_logger = mocker.patch.object(ext_mod, "get_logger")
-        doc = "PT Telekomunikasi ​ Mobile ​ 1995 selular ​ telecommunication"
+        doc = "PT Telekomunikasi \u200b Mobile \u200b 1995 selular \u200b telecommunication"
 
         ext_mod._is_name_in_document("PT Telekomunikasi Selular", doc)
 
@@ -922,7 +922,7 @@ class TestWindowedSubsequenceGrounding:
     def test_zero_width_space_stripped_in_grounding(self):
         from idi_corporate_structure.extractor import _is_name_in_document
 
-        assert _is_name_in_document("FooBar Holdings LLC", "Foo​Bar Holdings LLC (Delaware)")
+        assert _is_name_in_document("FooBar Holdings LLC", "Foo\u200bBar Holdings LLC (Delaware)")
 
     def test_control_char_stripped_in_grounding(self):
         """A C0 control char embedded in both name and doc is normalized away consistently."""
@@ -943,7 +943,7 @@ class TestIsNameGrounded:
             _normalize,
         )
 
-        doc = "Apple Operations LLC (Delaware) — PT Telekomunikasi ​ Mobile selular"
+        doc = "Apple Operations LLC (Delaware) — PT Telekomunikasi \u200b Mobile selular"
         doc_norm, doc_compact = _normalize(doc), _compact(doc)
 
         assert _is_name_grounded("Apple Operations LLC", doc_norm, doc_compact)  # strict

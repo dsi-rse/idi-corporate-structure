@@ -133,7 +133,7 @@ class Pipeline(ABC):
         Returns:
             None
         """
-        start_time = datetime.datetime.now()
+        start_time = datetime.datetime.now(datetime.UTC)
 
         input_data = self.load_input()
         self.logger.info("Located %d filings with exhibits to process", len(input_data))
@@ -145,7 +145,7 @@ class Pipeline(ABC):
         else:
             self.logger.info("No input data found, skipping pipeline")
 
-        end_time = datetime.datetime.now()
+        end_time = datetime.datetime.now(datetime.UTC)
         self.logger.info("Elasped time: %s", end_time - start_time)
 
 
@@ -225,7 +225,7 @@ class SubsidiaryPipeline(Pipeline):
     """Pipeline that fetches Exhibit 21 filings from SEC EDGAR and extracts subsidiary data."""
 
     CIK_JSON_URL = "https://data.sec.gov/submissions"
-    _INPUT_SAMPLE_SIZE = int(os.environ.get("INPUT_SAMPLE_SIZE", 0))
+    _INPUT_SAMPLE_SIZE = int(os.environ.get("INPUT_SAMPLE_SIZE", "0"))
     _LOG_EVERY = 5
     # Coarser cadence for the input scan: it sweeps every candidate filing
     # (~100k for a full historical range), far more than the documents extracted.
@@ -591,7 +591,8 @@ class SubsidiaryPipeline(Pipeline):
                     stat_keys=("failed_subsidiaries", "truncated_extractions"),
                 )
 
-            except Exception as e:
+            # Catch-all so one bad filing can't kill the worker; recorded as a failure.
+            except Exception as e:  # noqa: BLE001
                 self._record_failure(
                     (filing.cik, filing.accession_number),
                     FailureType.EXTRACTION_FAILED,
@@ -625,7 +626,7 @@ class SubsidiaryPipeline(Pipeline):
         try:
             with pdfplumber.open(io.BytesIO(raw_content)) as pdf:
                 text = "\n\n".join(page.extract_text() or "" for page in pdf.pages)
-        except Exception:
+        except Exception:  # noqa: BLE001
             self._record_failure(
                 (filing.cik, filing.accession_number),
                 FailureType.NO_EXHIBIT_CONTENT,
@@ -651,7 +652,7 @@ class SubsidiaryPipeline(Pipeline):
 
             try:
                 raw_exhibit = load_content(doc.s3_key)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 self._record_failure(
                     (filing.cik, filing.accession_number),
                     FailureType.NO_EXHIBIT_CONTENT,

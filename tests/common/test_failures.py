@@ -156,7 +156,7 @@ class TestFailureRegistryThreadSafety:
             try:
                 for i in range(start, start + count):
                     registry.add((f"CIK{i:010d}", f"ACC{i:020d}"), FailureType.MISMATCHED_LENGTHS)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 — record any thread error for the assertion
                 errors.append(e)
 
         threads = [threading.Thread(target=add_entries, args=(i * 50, 50)) for i in range(4)]

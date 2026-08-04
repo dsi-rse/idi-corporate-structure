@@ -177,7 +177,7 @@ def get_dates(args: argparse.Namespace) -> tuple[datetime.date, datetime.date]:
 
 def main() -> None:
     """Main function to run the pipeline orchestrator."""
-    start = datetime.datetime.now()
+    start = datetime.datetime.now(datetime.UTC)
     args = get_args()
 
     # Set before any logger is created: get_logger reads LOG_LEVEL from the
@@ -213,8 +213,8 @@ def main() -> None:
     pipeline = SubsidiaryPipeline(config=config, sec_client=sec_client, extractor=extractor)
     pipeline.run()
 
-    end = datetime.datetime.now()
-    print(f"Elasped time: {end - start}")
+    end = datetime.datetime.now(datetime.UTC)
+    print(f"Elapsed time: {end - start}")
 
 
 if __name__ == "__main__":
