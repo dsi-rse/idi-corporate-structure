@@ -14,7 +14,7 @@ from idi_corporate_structure.extractor import (
     ExtractionTruncatedError,
 )
 from idi_corporate_structure.failures import FailureType
-from idi_corporate_structure.pipeline import CompanyMetaFetchError
+from idi_corporate_structure.pipeline import CompanyMetaFetchError, _ResultSink
 from idi_corporate_structure.types import CompanyMeta, Filing, Subsidiary
 from tests.conftest import make_exhibit_response
 
@@ -710,87 +710,113 @@ class TestExtractWorker:
 class TestResultsWorker:
     """Tests for SubsidiaryPipeline._results_worker()."""
 
-    def _drain(self, pipeline, batches):
+    def _make_sink(self, pipeline):
+        return _ResultSink(
+            flush=pipeline.save_output, logger=pipeline.logger, total=pipeline._total_documents
+        )
+
+    def _run(self, pipeline, sink, batches):
         """Run the results worker synchronously over batches, then a sentinel."""
         results_queue = queue.Queue()
-        subsidiaries: list = []
         for batch in batches:
             results_queue.put(batch)
         results_queue.put(pipeline._RESULTS_SENTINEL)
-        pipeline._results_worker(results_queue, subsidiaries)  # returns at the sentinel
-        return subsidiaries
+        pipeline._results_worker(results_queue, sink)  # returns at the sentinel
 
-    def test_extends_buffer_with_batches(self, pipeline):
+    def test_feeds_batches_into_sink(self, pipeline):
+        sink = self._make_sink(pipeline)
         sub = make_subsidiary()
-        subsidiaries = self._drain(pipeline, [[sub], []])
 
-        assert subsidiaries == [sub]
+        self._run(pipeline, sink, [[sub], []])
+
+        assert sink.drain() == [sub]
 
     def test_counts_every_document(self, pipeline):
-        self._drain(pipeline, [[make_subsidiary()], [], [make_subsidiary()]])
+        self._run(
+            pipeline, self._make_sink(pipeline), [[make_subsidiary()], [], [make_subsidiary()]]
+        )
 
         assert pipeline.stats.extracted_documents == 3
 
     def test_sentinel_stops_worker(self, pipeline):
         # Returns only because the sentinel is consumed; nothing else enqueued.
-        assert self._drain(pipeline, []) == []
+        self._run(pipeline, self._make_sink(pipeline), [])  # completes → sentinel handled
 
     def test_checkpoints_at_configured_cadence(self, pipeline, mocker):
         pipeline.config.checkpoint_every = 2
-        spy = mocker.patch.object(pipeline, "_checkpoint")
+        sink = self._make_sink(pipeline)
+        spy = mocker.patch.object(sink, "checkpoint")
 
-        self._drain(pipeline, [[], [], [], []])  # milestones at 2 and 4 documents
+        self._run(pipeline, sink, [[], [], [], []])  # milestones at 2 and 4 documents
 
         assert spy.call_count == 2
 
     def test_does_not_checkpoint_when_disabled(self, pipeline, mocker):
         pipeline.config.checkpoint_every = 0
-        spy = mocker.patch.object(pipeline, "_checkpoint")
+        sink = self._make_sink(pipeline)
+        spy = mocker.patch.object(sink, "checkpoint")
 
-        self._drain(pipeline, [[make_subsidiary()], []])
+        self._run(pipeline, sink, [[make_subsidiary()], []])
 
         spy.assert_not_called()
 
-    def test_clears_buffer_after_successful_checkpoint(self, pipeline):
-        """A successful checkpoint drops the flushed rows from memory (bounded buffer)."""
-        pipeline.config.checkpoint_every = 2
 
-        subsidiaries = self._drain(
-            pipeline, [[make_subsidiary(name="A LLC")], [make_subsidiary(name="B LLC")]]
+# ── _ResultSink ───────────────────────────────────────────────────────────────
+
+
+class TestResultSink:
+    """Tests for _ResultSink."""
+
+    def _make_sink(self, pipeline, flush=None):
+        return _ResultSink(
+            flush=flush or pipeline.save_output,
+            logger=pipeline.logger,
+            total=pipeline._total_documents,
         )
 
-        assert subsidiaries == []  # emptied after the flush
-        assert len(pd.read_parquet(pipeline.config.output_file)) == 2  # both persisted
+    def test_add_accumulates(self, pipeline):
+        sink = self._make_sink(pipeline)
+        a, b = make_subsidiary(name="A LLC"), make_subsidiary(name="B LLC")
 
-    def test_keeps_buffer_when_checkpoint_fails(self, pipeline, mocker):
-        """A failed checkpoint retains the buffer so the rows retry on the final save."""
-        pipeline.config.checkpoint_every = 2
-        mocker.patch.object(pipeline, "save_output", side_effect=RuntimeError("s3 down"))
+        sink.add([a])
+        sink.add([b])
 
-        subsidiaries = self._drain(
-            pipeline, [[make_subsidiary(name="A LLC")], [make_subsidiary(name="B LLC")]]
-        )
+        assert sink.drain() == [a, b]
 
-        assert len(subsidiaries) == 2  # not cleared
+    def test_checkpoint_flushes_and_clears(self, pipeline):
+        sink = self._make_sink(pipeline)  # flush = real save_output
+        sink.add([make_subsidiary()])
 
+        sink.checkpoint(extracted=1)
 
-# ── _checkpoint ───────────────────────────────────────────────────────────────
+        assert sink.drain() == []  # buffer emptied after a successful flush
+        assert len(pd.read_parquet(pipeline.config.output_file)) == 1  # persisted
 
+    def test_checkpoint_keeps_buffer_on_failure(self, pipeline, mocker):
+        flush = mocker.Mock(side_effect=RuntimeError("s3 down"))
+        sink = self._make_sink(pipeline, flush=flush)
+        sink.add([make_subsidiary()])
 
-class TestCheckpoint:
-    """Tests for SubsidiaryPipeline._checkpoint()."""
+        sink.checkpoint(extracted=1)  # must not raise
 
-    def test_writes_results_to_output_file(self, pipeline):
-        assert pipeline._checkpoint([make_subsidiary()], extracted=1) is True
+        assert len(sink.drain()) == 1  # retained for retry
 
-        df = pd.read_parquet(pipeline.config.output_file)
-        assert len(df) == 1
+    def test_checkpoint_is_noop_when_empty(self, pipeline, mocker):
+        flush = mocker.Mock()
+        sink = self._make_sink(pipeline, flush=flush)
 
-    def test_swallows_write_errors_and_reports_failure(self, pipeline, mocker):
-        """A failed checkpoint must not propagate and must report failure (keep buffer)."""
-        mocker.patch.object(pipeline, "save_output", side_effect=RuntimeError("s3 down"))
+        sink.checkpoint(extracted=1)
 
-        assert pipeline._checkpoint([make_subsidiary()], extracted=1) is False  # must not raise
+        flush.assert_not_called()
+
+    def test_drain_detaches_buffer(self, pipeline):
+        sink = self._make_sink(pipeline)
+        sink.add([make_subsidiary()])
+
+        first = sink.drain()
+
+        assert len(first) == 1
+        assert sink.drain() == []  # second drain is empty — buffer detached
 
 
 # ── _extract_pdf_text ─────────────────────────────────────────────────────────

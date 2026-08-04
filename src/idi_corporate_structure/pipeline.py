@@ -4,11 +4,13 @@
 import dataclasses
 import datetime
 import io
+import logging
 import os
 import queue
 import re
 import threading
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from itertools import islice
 
 # Third party imports
@@ -145,6 +147,78 @@ class Pipeline(ABC):
 
         end_time = datetime.datetime.now()
         self.logger.info("Elasped time: %s", end_time - start_time)
+
+
+class _ResultSink:
+    """Owns the extracted-results buffer and its checkpoint lifecycle.
+
+    Encapsulates the mutable results list so it is never shared with or returned to
+    the caller directly: the results worker feeds it via :meth:`add` / :meth:`checkpoint`,
+    and :meth:`process` collects the unflushed remainder via :meth:`drain` once that
+    worker has joined. Single-consumer by contract — only the results worker calls
+    :meth:`add`/:meth:`checkpoint`, and :meth:`drain` runs after it has exited — so the
+    lockless extend/flush/clear is safe as long as that invariant holds.
+    """
+
+    def __init__(
+        self,
+        flush: Callable[[list[Subsidiary]], None],
+        logger: logging.Logger,
+        total: int,
+    ) -> None:
+        """Initialize the sink.
+
+        Args:
+            flush: Callable that persists a list of subsidiaries (e.g.
+                :meth:`SubsidiaryPipeline.save_output`).
+            logger: Logger for checkpoint progress/failure lines.
+            total: Total documents to extract, for the checkpoint log line.
+        """
+        self._buffer: list[Subsidiary] = []
+        self._flush = flush
+        self._logger = logger
+        self._total = total
+
+    def add(self, batch: list[Subsidiary]) -> None:
+        """Accumulate one processed document's extracted subsidiaries."""
+        self._buffer.extend(batch)
+
+    def checkpoint(self, extracted: int) -> None:
+        """Flush the buffer to the output, dropping it from memory on success.
+
+        Keeps the buffer bounded (~checkpoint interval) instead of growing to millions
+        of rows over a run. The flush merges with the existing output, so flushed rows
+        are not lost. A failed write is logged and swallowed, and the buffer is kept so
+        its rows retry on the next checkpoint or the final :meth:`drain`.
+
+        Args:
+            extracted: Documents processed so far, for the log line.
+        """
+        if not self._buffer:
+            return
+        try:
+            self._logger.info(
+                "Checkpointing %d subsidiaries at %d / %d documents",
+                len(self._buffer),
+                extracted,
+                self._total,
+            )
+            self._flush(self._buffer)
+            self._buffer = []
+        except Exception:
+            self._logger.exception(
+                "Checkpoint write failed at %d documents; keeping buffer for retry", extracted
+            )
+
+    def drain(self) -> list[Subsidiary]:
+        """Return the rows not yet flushed and detach them from the sink.
+
+        Called by :meth:`process` after the results worker has joined, so there is no
+        concurrent mutation. Returns the tail accumulated since the last checkpoint
+        (or the full set when checkpointing is disabled) for the final save.
+        """
+        remaining, self._buffer = self._buffer, []
+        return remaining
 
 
 class SubsidiaryPipeline(Pipeline):
@@ -636,22 +710,21 @@ class SubsidiaryPipeline(Pipeline):
 
         return exhibit_content
 
-    def _results_worker(self, results_queue: queue.Queue, subsidiaries: list[Subsidiary]) -> None:
-        """Single consumer that accumulates result batches and checkpoints them.
+    def _results_worker(self, results_queue: queue.Queue, sink: "_ResultSink") -> None:
+        """Single consumer that feeds result batches into ``sink`` and checkpoints it.
 
-        Because only this thread mutates ``subsidiaries`` or writes the output file,
-        the progress-log and checkpoint cadences are driven by one race-free counter
-        with no locking. Consumes batches until it receives
-        :attr:`_RESULTS_SENTINEL`, then returns; the final complete write is left to
-        :meth:`save_output` in :meth:`run`, so this worker only writes periodic
-        checkpoints that make an interrupted run resumable (via
-        :meth:`_load_processed_accessions` / :meth:`_should_skip`) without
+        Because only this thread drives ``sink``, the progress-log and checkpoint
+        cadences run off one race-free counter with no locking. Consumes batches until
+        it receives :attr:`_RESULTS_SENTINEL`, then returns; the final complete write is
+        left to :meth:`save_output` in :meth:`run` (over ``sink.drain()``), so this
+        worker only writes periodic checkpoints that make an interrupted run resumable
+        (via :meth:`_load_processed_accessions` / :meth:`_should_skip`) without
         re-extracting — and re-paying for — completed documents.
 
         Args:
             results_queue: Queue of ``list[Subsidiary]`` batches (one per processed
                 document), terminated by :attr:`_RESULTS_SENTINEL`.
-            subsidiaries: Results buffer this worker owns and extends in place.
+            sink: Results sink this worker feeds; it owns the buffer and its flushes.
 
         Returns:
             None
@@ -661,7 +734,7 @@ class SubsidiaryPipeline(Pipeline):
             try:
                 if batch is self._RESULTS_SENTINEL:
                     return
-                subsidiaries.extend(batch)
+                sink.add(batch)
                 extracted = self.stats.increment("extracted_documents")
                 if extracted % self._LOG_EVERY == 0:
                     self.logger.info(
@@ -671,47 +744,9 @@ class SubsidiaryPipeline(Pipeline):
                         self._total_documents,
                     )
                 if self.config.checkpoint_every and extracted % self.config.checkpoint_every == 0:
-                    # Drop the flushed rows from memory once they're safely on disk,
-                    # so the buffer stays bounded (~checkpoint_every documents) instead
-                    # of growing to millions of rows over a full run. save_output merges
-                    # with the existing parquet, so cleared rows are not lost; the final
-                    # save in run() re-merges the remaining tail. Keep the buffer if the
-                    # write failed, so its rows retry on the next checkpoint / final save.
-                    if self._checkpoint(subsidiaries, extracted):
-                        subsidiaries.clear()
+                    sink.checkpoint(extracted)
             finally:
                 results_queue.task_done()
-
-    def _checkpoint(self, subsidiaries: list[Subsidiary], extracted: int) -> bool:
-        """Write a mid-run checkpoint of results so an interrupted run is resumable.
-
-        Called only from the single results worker, so no locking is needed. A failed
-        write is logged and swallowed (the final :meth:`save_output` in :meth:`run`
-        still writes whatever remains in the buffer), and reported via the return
-        value so the caller can decide whether to drop the flushed rows.
-
-        Args:
-            subsidiaries: The results buffer to persist (not mutated during the call —
-                only the calling results worker mutates it).
-            extracted: Documents processed so far, for the log line.
-
-        Returns:
-            True if the write succeeded (safe to clear the buffer), False otherwise.
-        """
-        try:
-            self.logger.info(
-                "Checkpointing %d subsidiaries at %d / %d documents",
-                len(subsidiaries),
-                extracted,
-                self._total_documents,
-            )
-            self.save_output(subsidiaries)
-            return True
-        except Exception:
-            self.logger.exception(
-                "Checkpoint write failed at %d documents; keeping buffer for retry", extracted
-            )
-            return False
 
     def process(self, input_list: list[Filing]) -> list[Subsidiary]:
         """Fetch exhibit content and extract subsidiaries from each filing.
@@ -733,7 +768,7 @@ class SubsidiaryPipeline(Pipeline):
         """
         work_queue = queue.Queue(maxsize=self.config.num_workers * 2)
         results_queue: queue.Queue = queue.Queue()
-        subsidiaries: list[Subsidiary] = []
+        sink = _ResultSink(flush=self.save_output, logger=self.logger, total=self._total_documents)
 
         # Producers extract in parallel; a single consumer owns the results buffer.
         extract_workers = [
@@ -750,7 +785,7 @@ class SubsidiaryPipeline(Pipeline):
 
         results_worker = threading.Thread(
             target=self._results_worker,
-            args=(results_queue, subsidiaries),
+            args=(results_queue, sink),
             daemon=True,
             name="results-worker",
         )
@@ -765,12 +800,12 @@ class SubsidiaryPipeline(Pipeline):
 
         # Every producer posts its batch before task_done, so once work_queue drains
         # all batches are on results_queue. Signal end-of-stream and let the consumer
-        # finish; run() performs the final, complete save_output afterwards.
+        # finish; run() performs the final, complete save_output over the drained tail.
         work_queue.join()
         results_queue.put(self._RESULTS_SENTINEL)
         results_worker.join()
 
-        return subsidiaries
+        return sink.drain()
 
     def save_output(self, processed_list: list[Subsidiary]) -> None:
         """Deduplicate and persist extracted subsidiaries as a Parquet file.
