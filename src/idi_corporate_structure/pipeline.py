@@ -198,7 +198,7 @@ class _ResultSink:
             return
         try:
             self._logger.info(
-                "Checkpointing %d subsidiaries at %d / %d documents",
+                "Checkpointing %d subsidiaries at %d / %d filings",
                 len(self._buffer),
                 extracted,
                 self._total,
@@ -251,9 +251,10 @@ class SubsidiaryPipeline(Pipeline):
             classifier=CorporateStructureFailureClassifier(),
             flush_every=config.failure_flush_every,
         )
-        # Total exhibit documents to extract, known once load_input has selected
-        # exhibits for every filing. Used as the fixed denominator in progress logs.
-        self._total_documents = 0
+        # Total filings to process, known once load_input has selected exhibits.
+        # Used as the fixed denominator in progress logs. Filings (not documents)
+        # are the unit of work so a filing's results are always flushed together.
+        self._total_filings = 0
         self._company_meta_cache: dict[str, CompanyMeta] = {}
 
     def _load_processed_accessions(self) -> set[str]:
@@ -436,12 +437,12 @@ class SubsidiaryPipeline(Pipeline):
 
             filings.append(filing)
 
-        self._total_documents = sum(len(f.exhibit_documents) for f in filings)
+        self._total_filings = len(filings)
         self.logger.info(
-            "Scan complete: %d filings scanned, %d with exhibits, %d documents to extract",
+            "Scan complete: %d filings scanned, %d with exhibits, %d exhibit documents",
             self.stats.total_filing,
-            len(filings),
-            self._total_documents,
+            self._total_filings,
+            sum(len(f.exhibit_documents) for f in filings),
         )
 
         return filings
@@ -514,100 +515,101 @@ class SubsidiaryPipeline(Pipeline):
             )
 
     def _extract_worker(self, work_queue: queue.Queue, results_queue: queue.Queue) -> None:
-        """Producer thread that extracts subsidiaries from queued exhibit documents.
+        """Producer thread that extracts subsidiaries for one filing at a time.
 
-        Runs as a daemon thread, consuming ``(filing, exhibit_contents)`` tuples from
-        ``work_queue`` and posting each document's extracted ``list[Subsidiary]``
-        batch to ``results_queue`` for the single results worker to accumulate and
-        persist. Extraction errors are caught, logged, and recorded in the failure
-        registry so the loop continues.
-
-        One item is posted per processed document — an empty list on failure or a
-        zero-subsidiary document — so the results worker can count documents (not
-        just subsidiaries) and keep the ``extracted / total`` progress accurate.
+        Consumes ``(filing, documents)`` items from ``work_queue`` — ``documents`` is
+        the filing's list of exhibit-content dicts — extracts each document,
+        accumulates the filing's subsidiaries, and posts a SINGLE accession-complete
+        batch to ``results_queue``. Posting a whole filing's results together means a
+        checkpoint can never persist a partial accession, so the accession-level
+        resume check (:meth:`_should_skip`) stays correct even if the run is
+        interrupted mid-flush. Per-document extraction errors are caught, logged, and
+        recorded so the filing's remaining documents (and later filings) still process.
 
         Args:
-            work_queue: Queue of ``(Filing, dict)`` tuples to process. Each dict has
-                ``"url"`` and ``"data"`` keys for the exhibit content.
-            results_queue: Queue each document's ``list[Subsidiary]`` batch is posted
-                to for the results worker to consume.
+            work_queue: Queue of ``(Filing, list[dict])`` items. Each dict has ``"url"``
+                and ``"data"`` keys for one exhibit document's content.
+            results_queue: Queue the filing's combined ``list[Subsidiary]`` batch is
+                posted to for the results worker to consume.
 
         Returns:
             None
         """
         while True:
-            filing, exhibit_contents = work_queue.get()
+            filing, documents = work_queue.get()
             batch: list[Subsidiary] = []
             try:
-                subsidiaries_batch, ungrounded_name, ungrounded_location, num_chunks = (
-                    self.extractor.extract(filing, exhibit_contents)
-                )
-                self._report_extraction(
-                    num_chunks=num_chunks,
-                    ungrounded_name=ungrounded_name,
-                    ungrounded_location=ungrounded_location,
-                    num_subsidiaries=len(subsidiaries_batch),
-                    filing=filing,
-                )
-                batch = subsidiaries_batch
+                for document in documents:
+                    try:
+                        subsidiaries_batch, ungrounded_name, ungrounded_location, num_chunks = (
+                            self.extractor.extract(filing, document)
+                        )
+                        self._report_extraction(
+                            num_chunks=num_chunks,
+                            ungrounded_name=ungrounded_name,
+                            ungrounded_location=ungrounded_location,
+                            num_subsidiaries=len(subsidiaries_batch),
+                            filing=filing,
+                        )
+                        batch.extend(subsidiaries_batch)
 
-            except DocumentError as e:
-                self._record_failure(
-                    (filing.cik, filing.accession_number),
-                    FailureType.DOCUMENT_ERROR,
-                    "error",
-                    "Document error for filing: %s - %s - %s: %s @ %s",
-                    filing.cik,
-                    filing.accession_number,
-                    filing.filing_date,
-                    e,
-                    exhibit_contents["url"],
-                )
+                    except DocumentError as e:
+                        self._record_failure(
+                            (filing.cik, filing.accession_number),
+                            FailureType.DOCUMENT_ERROR,
+                            "error",
+                            "Document error for filing: %s - %s - %s: %s @ %s",
+                            filing.cik,
+                            filing.accession_number,
+                            filing.filing_date,
+                            e,
+                            document["url"],
+                        )
 
-            except ExtractionTimeoutError:
-                self._record_failure(
-                    (filing.cik, filing.accession_number),
-                    FailureType.TIMEOUT_ERROR,
-                    "error",
-                    "Timeout extracting subsidiaries from filing: %s - %s - %s @ %s",
-                    filing.cik,
-                    filing.accession_number,
-                    filing.filing_date,
-                    exhibit_contents["url"],
-                    stat_keys=("failed_subsidiaries", "timeout_subsidiaries"),
-                )
+                    except ExtractionTimeoutError:
+                        self._record_failure(
+                            (filing.cik, filing.accession_number),
+                            FailureType.TIMEOUT_ERROR,
+                            "error",
+                            "Timeout extracting subsidiaries from filing: %s - %s - %s @ %s",
+                            filing.cik,
+                            filing.accession_number,
+                            filing.filing_date,
+                            document["url"],
+                            stat_keys=("failed_subsidiaries", "timeout_subsidiaries"),
+                        )
 
-            except ExtractionTruncatedError as e:
-                self._record_failure(
-                    (filing.cik, filing.accession_number),
-                    FailureType.TRUNCATED_ERROR,
-                    "error",
-                    "Truncated extraction for filing: %s - %s - %s: %s @ %s",
-                    filing.cik,
-                    filing.accession_number,
-                    filing.filing_date,
-                    e,
-                    exhibit_contents["url"],
-                    stat_keys=("failed_subsidiaries", "truncated_extractions"),
-                )
+                    except ExtractionTruncatedError as e:
+                        self._record_failure(
+                            (filing.cik, filing.accession_number),
+                            FailureType.TRUNCATED_ERROR,
+                            "error",
+                            "Truncated extraction for filing: %s - %s - %s: %s @ %s",
+                            filing.cik,
+                            filing.accession_number,
+                            filing.filing_date,
+                            e,
+                            document["url"],
+                            stat_keys=("failed_subsidiaries", "truncated_extractions"),
+                        )
 
-            # Catch-all so one bad filing can't kill the worker; recorded as a failure.
-            except Exception as e:  # noqa: BLE001
-                self._record_failure(
-                    (filing.cik, filing.accession_number),
-                    FailureType.EXTRACTION_FAILED,
-                    "exception",
-                    "Error extracting subsidiaries from filing: %s - %s - %s @ %s: %s",
-                    filing.cik,
-                    filing.accession_number,
-                    filing.filing_date,
-                    exhibit_contents["url"],
-                    e,
-                )
+                    # Catch-all so one bad document can't kill the worker; recorded as a failure.
+                    except Exception as e:  # noqa: BLE001
+                        self._record_failure(
+                            (filing.cik, filing.accession_number),
+                            FailureType.EXTRACTION_FAILED,
+                            "exception",
+                            "Error extracting subsidiaries from filing: %s - %s - %s @ %s: %s",
+                            filing.cik,
+                            filing.accession_number,
+                            filing.filing_date,
+                            document["url"],
+                            e,
+                        )
 
             finally:
-                # Post the batch (empty on failure) before marking the task done, so
-                # work_queue.join() implies every batch is already on results_queue.
+                # Post the filing's combined (accession-complete) batch before marking
+                # the task done, so work_queue.join() implies every batch is enqueued.
                 results_queue.put(batch)
                 work_queue.task_done()
 
@@ -736,13 +738,13 @@ class SubsidiaryPipeline(Pipeline):
                 if batch is self._RESULTS_SENTINEL:
                     return
                 sink.add(batch)
-                extracted = self.stats.increment("extracted_documents")
+                extracted = self.stats.increment("extracted_filings")
                 if extracted % self._LOG_EVERY == 0:
                     self.logger.info(
-                        "Progress: %d extracted, %d queued, %d total documents",
+                        "Progress: %d extracted, %d queued, %d total filings",
                         extracted,
-                        self.stats.queued_documents,
-                        self._total_documents,
+                        self.stats.queued_filings,
+                        self._total_filings,
                     )
                 if self.config.checkpoint_every and extracted % self.config.checkpoint_every == 0:
                     sink.checkpoint(extracted)
@@ -769,7 +771,7 @@ class SubsidiaryPipeline(Pipeline):
         """
         work_queue = queue.Queue(maxsize=self.config.num_workers * 2)
         results_queue: queue.Queue = queue.Queue()
-        sink = _ResultSink(flush=self.save_output, logger=self.logger, total=self._total_documents)
+        sink = _ResultSink(flush=self.save_output, logger=self.logger, total=self._total_filings)
 
         # Producers extract in parallel; a single consumer owns the results buffer.
         extract_workers = [
@@ -792,12 +794,12 @@ class SubsidiaryPipeline(Pipeline):
         )
         results_worker.start()
 
-        # SEC operations to fetch exhibit data — one task per document
+        # SEC fetch on the main thread — one task per filing (all its exhibit
+        # documents together) so a filing's results are extracted and flushed as a unit.
         for filing in input_list:
             exhibit_contents = self._fetch_exhibit(filing)
-            for exhibit_content in exhibit_contents:
-                work_queue.put((filing, exhibit_content))
-                self.stats.increment("queued_documents")
+            work_queue.put((filing, exhibit_contents))
+            self.stats.increment("queued_filings")
 
         # Every producer posts its batch before task_done, so once work_queue drains
         # all batches are on results_queue. Signal end-of-stream and let the consumer

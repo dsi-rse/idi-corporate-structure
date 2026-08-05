@@ -302,7 +302,7 @@ class TestLoadInput:
         assert filings[0].cik == "0000320193"
         assert len(filings[0].exhibit_documents) == 1
 
-    def test_sets_total_documents_from_selected_exhibits(self, pipeline, mocker):
+    def test_sets_total_filings_from_returned_filings(self, pipeline, mocker):
         mocker.patch(
             "idi_corporate_structure.pipeline.iter_filings_by_form_type",
             return_value=[
@@ -314,8 +314,8 @@ class TestLoadInput:
 
         filings = pipeline.load_input()
 
-        assert pipeline._total_documents == sum(len(f.exhibit_documents) for f in filings)
-        assert pipeline._total_documents == 2
+        assert pipeline._total_filings == len(filings)
+        assert pipeline._total_filings == 2
 
     def test_logs_scan_progress_at_cadence(self, pipeline, mocker):
         pipeline._LOAD_LOG_EVERY = 1
@@ -548,7 +548,7 @@ class TestExtractWorker:
         work_queue, results_queue = queue.Queue(), queue.Queue()
         self._start_worker(pipeline, work_queue, results_queue)
 
-        work_queue.put((sample_filing, exhibit))
+        work_queue.put((sample_filing, [exhibit]))
         work_queue.join()
 
         pipeline.extractor.extract.assert_called_once_with(sample_filing, exhibit)
@@ -560,7 +560,7 @@ class TestExtractWorker:
         work_queue, results_queue = queue.Queue(), queue.Queue()
         self._start_worker(pipeline, work_queue, results_queue)
 
-        work_queue.put((sample_filing, make_exhibit_response()))
+        work_queue.put((sample_filing, [make_exhibit_response()]))
         work_queue.join()
 
         assert results_queue.get_nowait() == [subsidiary]
@@ -569,7 +569,7 @@ class TestExtractWorker:
         work_queue, results_queue = queue.Queue(), queue.Queue()
         self._start_worker(pipeline, work_queue, results_queue)
 
-        work_queue.put((sample_filing, make_exhibit_response()))
+        work_queue.put((sample_filing, [make_exhibit_response()]))
         work_queue.join()  # completes only if task_done() was called
 
     def test_marks_work_task_done_on_exception(self, pipeline, sample_filing):
@@ -578,7 +578,7 @@ class TestExtractWorker:
         work_queue, results_queue = queue.Queue(), queue.Queue()
         self._start_worker(pipeline, work_queue, results_queue)
 
-        work_queue.put((sample_filing, make_exhibit_response()))
+        work_queue.put((sample_filing, [make_exhibit_response()]))
         work_queue.join()  # completes only if task_done() is called in finally
 
     def test_increments_failed_subsidiaries_on_exception(self, pipeline, sample_filing):
@@ -587,7 +587,7 @@ class TestExtractWorker:
         work_queue, results_queue = queue.Queue(), queue.Queue()
         self._start_worker(pipeline, work_queue, results_queue)
 
-        work_queue.put((sample_filing, make_exhibit_response()))
+        work_queue.put((sample_filing, [make_exhibit_response()]))
         work_queue.join()
 
         assert pipeline.stats.failed_subsidiaries == 1
@@ -599,7 +599,7 @@ class TestExtractWorker:
         work_queue, results_queue = queue.Queue(), queue.Queue()
         self._start_worker(pipeline, work_queue, results_queue)
 
-        work_queue.put((sample_filing, make_exhibit_response()))
+        work_queue.put((sample_filing, [make_exhibit_response()]))
         work_queue.join()
 
         spy.assert_called_once_with(
@@ -617,7 +617,7 @@ class TestExtractWorker:
         work_queue, results_queue = queue.Queue(), queue.Queue()
         self._start_worker(pipeline, work_queue, results_queue)
 
-        work_queue.put((sample_filing, exhibit))
+        work_queue.put((sample_filing, [exhibit]))
         work_queue.join()
 
         exception_spy.assert_called_once()
@@ -632,7 +632,7 @@ class TestExtractWorker:
         work_queue, results_queue = queue.Queue(), queue.Queue()
         self._start_worker(pipeline, work_queue, results_queue)
 
-        work_queue.put((sample_filing, make_exhibit_response()))
+        work_queue.put((sample_filing, [make_exhibit_response()]))
         work_queue.join()
 
         spy.assert_called_once_with(
@@ -645,7 +645,7 @@ class TestExtractWorker:
         work_queue, results_queue = queue.Queue(), queue.Queue()
         self._start_worker(pipeline, work_queue, results_queue)
 
-        work_queue.put((sample_filing, make_exhibit_response()))
+        work_queue.put((sample_filing, [make_exhibit_response()]))
         work_queue.join()
 
         assert pipeline.stats.timeout_subsidiaries == 1
@@ -657,7 +657,7 @@ class TestExtractWorker:
         work_queue, results_queue = queue.Queue(), queue.Queue()
         self._start_worker(pipeline, work_queue, results_queue)
 
-        work_queue.put((sample_filing, make_exhibit_response()))
+        work_queue.put((sample_filing, [make_exhibit_response()]))
         work_queue.join()
 
         assert pipeline.stats.chunked_extractions == 1
@@ -668,7 +668,7 @@ class TestExtractWorker:
         work_queue, results_queue = queue.Queue(), queue.Queue()
         self._start_worker(pipeline, work_queue, results_queue)
 
-        work_queue.put((sample_filing, make_exhibit_response()))
+        work_queue.put((sample_filing, [make_exhibit_response()]))
         work_queue.join()
 
         assert pipeline.stats.chunked_extractions == 0
@@ -682,7 +682,7 @@ class TestExtractWorker:
         work_queue, results_queue = queue.Queue(), queue.Queue()
         self._start_worker(pipeline, work_queue, results_queue)
 
-        work_queue.put((sample_filing, make_exhibit_response()))
+        work_queue.put((sample_filing, [make_exhibit_response()]))
         work_queue.join()
 
         assert pipeline.stats.truncated_extractions == 1
@@ -698,7 +698,7 @@ class TestExtractWorker:
         work_queue, results_queue = queue.Queue(), queue.Queue()
         self._start_worker(pipeline, work_queue, results_queue)
 
-        work_queue.put((sample_filing, make_exhibit_response()))
+        work_queue.put((sample_filing, [make_exhibit_response()]))
         work_queue.join()
 
         assert results_queue.get_nowait() == []
@@ -712,7 +712,7 @@ class TestResultsWorker:
 
     def _make_sink(self, pipeline):
         return _ResultSink(
-            flush=pipeline.save_output, logger=pipeline.logger, total=pipeline._total_documents
+            flush=pipeline.save_output, logger=pipeline.logger, total=pipeline._total_filings
         )
 
     def _run(self, pipeline, sink, batches):
@@ -731,12 +731,12 @@ class TestResultsWorker:
 
         assert sink.drain() == [sub]
 
-    def test_counts_every_document(self, pipeline):
+    def test_counts_every_filing(self, pipeline):
         self._run(
             pipeline, self._make_sink(pipeline), [[make_subsidiary()], [], [make_subsidiary()]]
         )
 
-        assert pipeline.stats.extracted_documents == 3
+        assert pipeline.stats.extracted_filings == 3
 
     def test_sentinel_stops_worker(self, pipeline):
         # Returns only because the sentinel is consumed; nothing else enqueued.
@@ -771,7 +771,7 @@ class TestResultSink:
         return _ResultSink(
             flush=flush or pipeline.save_output,
             logger=pipeline.logger,
-            total=pipeline._total_documents,
+            total=pipeline._total_filings,
         )
 
     def test_add_accumulates(self, pipeline):
@@ -1039,7 +1039,7 @@ class TestProcess:
 
         assert mock_fetch.call_count == 4
 
-    def test_increments_queued_documents_per_exhibit(self, pipeline, mocker):
+    def test_increments_queued_filings_once_per_filing(self, pipeline, mocker):
         filing = make_filing()
         mocker.patch.object(
             pipeline,
@@ -1049,7 +1049,8 @@ class TestProcess:
 
         pipeline.process([filing])
 
-        assert pipeline.stats.queued_documents == 2
+        # One filing enqueued as a single unit, regardless of its two exhibit documents.
+        assert pipeline.stats.queued_filings == 1
 
     def test_handles_extractor_exception_gracefully(self, pipeline, mocker):
         """A failed extraction should not crash the pipeline — other filings still processed."""

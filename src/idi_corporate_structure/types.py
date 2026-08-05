@@ -133,8 +133,8 @@ class PipelineStats:
     html_exhibits: int = 0
     txt_exhibits: int = 0
     pdf_exhibits: int = 0
-    queued_documents: int = 0
-    extracted_documents: int = 0
+    queued_filings: int = 0
+    extracted_filings: int = 0
 
     def __post_init__(self) -> None:
         """Initialize the pipeline stats."""
@@ -150,7 +150,7 @@ class PipelineStats:
         Returns:
             The field's new value. Returned under the same lock as the
             increment so callers can test milestones (e.g. "every N
-            documents") without a separate, racy read of the counter.
+            items") without a separate, racy read of the counter.
         """
         with self._lock:
             new_value = getattr(self, field) + n
