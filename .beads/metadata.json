@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "idi_corporate_structure",
+  "project_id": "5034b42e-20d7-4052-9121-236059d55017"
+}
