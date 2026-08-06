@@ -598,6 +598,7 @@ class GptExtractor(Extractor):
                 parent_tickers=",".join(filing.company.tickers),
                 parent_exchanges=",".join(filing.company.exchanges),
                 filing_date=filing.filing_date,
+                period_of_report=filing.period_of_report,
                 form_type=filing.form_type,
                 exhibit_type=filing.exhibit_type,
                 accession_number=filing.accession_number,

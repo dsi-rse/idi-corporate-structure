@@ -6,7 +6,7 @@ Automated pipeline for extracting subsidiary information from SEC 10-K (Exhibit 
 
 This processor consumes SEC filing data already collected by the upstream **sec-scraper** (stored in S3), and performs three stages:
 
-1. **Load** — read the scraper's `manifest.parquet` from the SEC bucket for the requested date range (or the most recent filings via `--daily`) to enumerate 10-K-family (Exhibit 21) and 20-F-family (Exhibit 8) filings; fetch per-company metadata (state of incorporation, business address, tickers, exchanges) from the SEC submissions API
+1. **Load** — read the scraper's `manifest.parquet` from the SEC bucket for the requested date range (or the most recent filings via `--daily`) to enumerate 10-K-family (Exhibit 21) and 20-F-family (Exhibit 8) filings, capturing each filing's submission date and its reporting period (`period_of_report`); fetch per-company metadata (state of incorporation, business address, tickers, exchanges) from the SEC submissions API
 2. **Retrieval** — load each filing's already-scraped exhibit content from S3 (HTML, plain text, or PDF)
 3. **Extraction** — pass exhibit content to `gpt-4.1-nano` using structured output to parse subsidiary names and incorporation locations. Each subsidiary name is grounded against the exhibit text — exact match, then a punctuation-insensitive match, then a windowed in-order token match for names split across table columns — and names not found in the source are dropped to guard against hallucinations. Output is structured `Subsidiary` records written to Parquet.
 
@@ -16,15 +16,26 @@ Processing tracks permanent failures to disk so interrupted runs do not re-attem
 
 ```
 {output_file}   # Parquet — one row per subsidiary, with parent-company metadata
-                # columns: parent_cik, filing_date, form_type, exhibit_type,
-                #   accession_number, exhibit_url, name, location, parent_name,
-                #   parent_state_of_incorporation, parent_business_* (street/city/state/
-                #   zip/country/country_code), parent_tickers, parent_exchanges,
-                #   source_quote, date_added
+                # columns: parent_cik, filing_date, period_of_report, form_type,
+                #   exhibit_type, accession_number, exhibit_url, name, location,
+                #   parent_name, parent_state_of_incorporation, parent_business_*
+                #   (street/city/state/zip/country/country_code), parent_tickers,
+                #   parent_exchanges, source_quote, date_added
 failures.json   # permanent failures keyed by (cik, accession_number)
 ```
 
 Output and failure paths support local directories or S3 URLs (`s3://bucket/path`). SEC input is always read from S3 via `--sec-bucket-prefix`.
+
+#### `filing_date` vs `period_of_report`
+
+These are different dates and are not interchangeable:
+
+- **`filing_date`** — when the filing was submitted to EDGAR.
+- **`period_of_report`** — the fiscal period the exhibit actually describes (ISO `YYYY-MM-DD`, taken from the filing index page's *Period of Report*).
+
+Delinquent filers submit several years of 10-Ks on the **same day**, each with its own Exhibit 21, so `filing_date` cannot identify which reporting year a subsidiary list covers. Accession number does not resolve it either — its prefix is a filer ID, not a sequence. For CIK 1583994, both accessions were filed 2017-02-24, and the *higher* one (`0001583994-17-000009`) is the older FY2014 exhibit, while `0001574540-17-000007` is FY2016. Select on `period_of_report`.
+
+Rows written before this column was added carry an empty string rather than a null; backfilling them is tracked separately.
 
 ---
 
@@ -385,6 +396,7 @@ Shared infrastructure lives in the [`idi-ftm2j-shared`](https://github.com/dsi-c
 | `no_exhibit_content` | No | Exhibit returned no content |
 | `document_error` | No | Exhibit document is too long to process |
 | `no_subsidiaries` | No | No subsidiaries found for the filing |
+| `missing_period_of_report` | No | Neither the scraped manifest nor the SEC submissions JSON dates the filing |
 | `truncated_error` | No | Model response cut off at the output token limit |
 | `extraction_failed` | Yes | GPT returned no structured data |
 | `timeout_error` | Yes | OpenAI API timed out |

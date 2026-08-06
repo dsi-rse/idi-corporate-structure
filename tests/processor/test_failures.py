@@ -55,6 +55,7 @@ class TestIsRetryable:
             FailureType.NO_10K_FILINGS,
             FailureType.NO_FILING_DIRECTORY,
             FailureType.NO_EXHIBIT_CONTENT,
+            FailureType.MISSING_PERIOD_OF_REPORT,
         ],
     )
     def test_non_retryable_types(self, classifier, failure_type):

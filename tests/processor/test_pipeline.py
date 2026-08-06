@@ -14,7 +14,7 @@ from idi_corporate_structure.extractor import (
     ExtractionTruncatedError,
 )
 from idi_corporate_structure.failures import FailureType
-from idi_corporate_structure.pipeline import CompanyMetaFetchError
+from idi_corporate_structure.pipeline import CompanyMetaFetchError, report_dates_by_accession
 from idi_corporate_structure.types import CompanyMeta, Filing, Subsidiary
 from tests.conftest import make_exhibit_response
 
@@ -42,6 +42,7 @@ def make_scraped_filing(
     filing_date: str = "2024-01-01",
     company_name: str = "APPLE INC",
     documents: list | None = None,
+    report_date: str = "2023-12-31",
 ) -> ScrapedFiling:
     """Build a minimal ScrapedFiling manifest for load_input tests."""
     return ScrapedFiling(
@@ -49,6 +50,7 @@ def make_scraped_filing(
         accession_number=accession_number,
         form_type=form_type,
         filing_date=filing_date,
+        report_date=report_date,
         index_url=f"https://www.sec.gov/Archives/edgar/data/{cik}/index.htm",
         company_name=company_name,
         documents=documents if documents is not None else [make_scraped_document()],
@@ -65,6 +67,7 @@ def make_subsidiary(
     return Subsidiary(
         parent_cik=parent_cik,
         filing_date="2024-09-28",
+        period_of_report="2024-12-31",
         form_type="10-K",
         exhibit_type="21",
         accession_number=accession_number,
@@ -79,6 +82,7 @@ def make_filing(cik: str = "0000320193", accession_number: str = "0000320193-24-
     return Filing(
         cik=cik,
         filing_date="2024-09-28",
+        period_of_report="2024-12-31",
         form_type="10-K",
         accession_number=accession_number,
         primary_document="",
@@ -167,6 +171,89 @@ class TestLoadProcessedAccessions:
 
 
 # ── _fetch_company_meta ───────────────────────────────────────────────────────
+
+
+class TestReportDatesByAccession:
+    """Tests for the report_dates_by_accession() submissions-JSON helper."""
+
+    def test_pairs_accession_to_report_date(self):
+        data = {
+            "filings": {
+                "recent": {
+                    "accessionNumber": ["0001583994-17-000009", "0001574540-17-000007"],
+                    "reportDate": ["2014-12-31", "2016-12-31"],
+                }
+            }
+        }
+
+        assert report_dates_by_accession(data) == {
+            "0001583994-17-000009": "2014-12-31",
+            "0001574540-17-000007": "2016-12-31",
+        }
+
+    def test_omits_blank_report_dates(self):
+        data = {
+            "filings": {
+                "recent": {
+                    "accessionNumber": ["ACC1", "ACC2"],
+                    "reportDate": ["", "2016-12-31"],
+                }
+            }
+        }
+
+        assert report_dates_by_accession(data) == {"ACC2": "2016-12-31"}
+
+    def test_returns_empty_for_missing_or_empty_filings(self):
+        assert report_dates_by_accession({}) == {}
+        assert report_dates_by_accession({"filings": {"recent": {}}}) == {}
+
+    def test_truncated_array_drops_tail_without_misaligning(self):
+        data = {
+            "filings": {
+                "recent": {
+                    "accessionNumber": ["ACC1", "ACC2", "ACC3"],
+                    "reportDate": ["2014-12-31"],
+                }
+            }
+        }
+
+        assert report_dates_by_accession(data) == {"ACC1": "2014-12-31"}
+
+    def test_folds_in_overflow_entries_that_carry_arrays(self):
+        data = {
+            "filings": {
+                "recent": {"accessionNumber": ["ACC1"], "reportDate": ["2014-12-31"]},
+                "files": [
+                    {"name": "CIK-submissions-001.json"},  # reference only — no arrays
+                    {"accessionNumber": ["ACC2"], "reportDate": ["2011-12-31"]},
+                ],
+            }
+        }
+
+        assert report_dates_by_accession(data) == {
+            "ACC1": "2014-12-31",
+            "ACC2": "2011-12-31",
+        }
+
+
+class TestPeriodOfReport:
+    """Tests for SubsidiaryPipeline._period_of_report()."""
+
+    def test_prefers_the_manifest_report_date(self, pipeline):
+        scraped = make_scraped_filing(report_date="2016-12-31")
+
+        assert pipeline._period_of_report(scraped) == "2016-12-31"
+
+    def test_returns_empty_when_cache_has_no_entry_for_the_cik(self, pipeline):
+        scraped = make_scraped_filing(report_date="")
+
+        assert pipeline._period_of_report(scraped) == ""
+
+    def test_returns_empty_when_cik_is_cached_but_accession_is_not(self, pipeline):
+        pipeline._report_date_cache["0000320193"] = {"OTHER-ACC": "2016-12-31"}
+        scraped = make_scraped_filing(accession_number="ACC1", report_date="")
+
+        assert pipeline._period_of_report(scraped) == ""
 
 
 class TestFetchCompanyMeta:
@@ -301,6 +388,165 @@ class TestLoadInput:
         assert len(filings) == 1
         assert filings[0].cik == "0000320193"
         assert len(filings[0].exhibit_documents) == 1
+
+    def test_copies_report_date_onto_period_of_report(self, pipeline, mocker):
+        mocker.patch(
+            "idi_corporate_structure.pipeline.iter_filings_by_form_type",
+            return_value=[make_scraped_filing(report_date="2016-12-31")],
+        )
+        mocker.patch.object(pipeline, "_fetch_company_meta", return_value=CompanyMeta())
+
+        filings = pipeline.load_input()
+
+        assert filings[0].period_of_report == "2016-12-31"
+
+    def test_period_of_report_is_independent_of_filing_date(self, pipeline, mocker):
+        # A delinquent filer's submission date and reporting period differ by
+        # years; the two fields must not be conflated.
+        mocker.patch(
+            "idi_corporate_structure.pipeline.iter_filings_by_form_type",
+            return_value=[make_scraped_filing(filing_date="2017-07-03", report_date="2014-05-31")],
+        )
+        mocker.patch.object(pipeline, "_fetch_company_meta", return_value=CompanyMeta())
+
+        filings = pipeline.load_input()
+
+        assert filings[0].filing_date == "2017-07-03"
+        assert filings[0].period_of_report == "2014-05-31"
+
+    def test_co_registrant_accessions_keep_distinct_periods(self, pipeline, mocker):
+        # CIK 1583994 filed two 10-Ks on the same day; the higher accession is
+        # the OLDER period, which is why accession order cannot be used.
+        mocker.patch(
+            "idi_corporate_structure.pipeline.iter_filings_by_form_type",
+            return_value=[
+                make_scraped_filing(
+                    accession_number="0001583994-17-000009",
+                    filing_date="2017-02-24",
+                    report_date="2014-12-31",
+                ),
+                make_scraped_filing(
+                    accession_number="0001574540-17-000007",
+                    filing_date="2017-02-24",
+                    report_date="2016-12-31",
+                ),
+            ],
+        )
+        mocker.patch.object(pipeline, "_fetch_company_meta", return_value=CompanyMeta())
+
+        periods = {f.accession_number: f.period_of_report for f in pipeline.load_input()}
+
+        assert periods == {
+            "0001583994-17-000009": "2014-12-31",
+            "0001574540-17-000007": "2016-12-31",
+        }
+
+    def test_blank_report_date_falls_back_to_submissions_json(self, pipeline, mocker):
+        mocker.patch(
+            "idi_corporate_structure.pipeline.iter_filings_by_form_type",
+            return_value=[
+                make_scraped_filing(accession_number="0000320193-24-000123", report_date="")
+            ],
+        )
+        pipeline.sec_client.query_endpoint.return_value = {
+            "data": {
+                "filings": {
+                    "recent": {
+                        "accessionNumber": ["0000320193-24-000123"],
+                        "reportDate": ["2024-09-28"],
+                    }
+                }
+            }
+        }
+
+        filings = pipeline.load_input()
+
+        assert len(filings) == 1
+        assert filings[0].period_of_report == "2024-09-28"
+
+    def test_fallback_issues_no_extra_sec_request(self, pipeline, mocker):
+        # The submissions response is already fetched for company metadata, so
+        # recovering the period must not cost a second round trip.
+        mocker.patch(
+            "idi_corporate_structure.pipeline.iter_filings_by_form_type",
+            return_value=[
+                make_scraped_filing(accession_number="ACC1", report_date=""),
+                make_scraped_filing(accession_number="ACC2", report_date=""),
+            ],
+        )
+        pipeline.sec_client.query_endpoint.return_value = {
+            "data": {
+                "filings": {
+                    "recent": {
+                        "accessionNumber": ["ACC1", "ACC2"],
+                        "reportDate": ["2023-12-31", "2022-12-31"],
+                    }
+                }
+            }
+        }
+
+        filings = pipeline.load_input()
+
+        # Both filings share a CIK: one request total, map built once and reused.
+        assert pipeline.sec_client.query_endpoint.call_count == 1
+        assert [f.period_of_report for f in filings] == ["2023-12-31", "2022-12-31"]
+
+    def test_manifest_report_date_wins_over_submissions_json(self, pipeline, mocker):
+        mocker.patch(
+            "idi_corporate_structure.pipeline.iter_filings_by_form_type",
+            return_value=[make_scraped_filing(accession_number="ACC1", report_date="2016-12-31")],
+        )
+        pipeline.sec_client.query_endpoint.return_value = {
+            "data": {
+                "filings": {"recent": {"accessionNumber": ["ACC1"], "reportDate": ["1999-01-01"]}}
+            }
+        }
+
+        filings = pipeline.load_input()
+
+        assert filings[0].period_of_report == "2016-12-31"
+
+    def test_excludes_filing_with_no_period_in_either_source(self, pipeline, mocker):
+        mocker.patch(
+            "idi_corporate_structure.pipeline.iter_filings_by_form_type",
+            return_value=[make_scraped_filing(accession_number="ACC1", report_date="")],
+        )
+        pipeline.sec_client.query_endpoint.return_value = {"data": {}}
+
+        filings = pipeline.load_input()
+
+        assert filings == []
+
+    def test_records_missing_period_failure_keyed_on_accession(self, pipeline, mocker):
+        mocker.patch(
+            "idi_corporate_structure.pipeline.iter_filings_by_form_type",
+            return_value=[
+                make_scraped_filing(cik="0000320193", accession_number="ACC1", report_date="")
+            ],
+        )
+        pipeline.sec_client.query_endpoint.return_value = {"data": {}}
+
+        pipeline.load_input()
+
+        assert ("0000320193", "ACC1") in pipeline.failure_registry
+        assert pipeline.stats.failed_filings == 1
+
+    def test_filing_rescued_by_fallback_is_not_dropped(self, pipeline, mocker):
+        mocker.patch(
+            "idi_corporate_structure.pipeline.iter_filings_by_form_type",
+            return_value=[make_scraped_filing(accession_number="ACC1", report_date="")],
+        )
+        pipeline.sec_client.query_endpoint.return_value = {
+            "data": {
+                "filings": {"recent": {"accessionNumber": ["ACC1"], "reportDate": ["2020-12-31"]}}
+            }
+        }
+
+        filings = pipeline.load_input()
+
+        assert len(filings) == 1
+        assert filings[0].period_of_report == "2020-12-31"
+        assert pipeline.stats.failed_filings == 0
 
     def test_increments_total_filing_per_scraped_filing(self, pipeline, mocker):
         mocker.patch(
@@ -937,6 +1183,7 @@ class TestSaveOutput:
             name=name,
             location="Ireland",
             filing_date="2024-09-28",
+            period_of_report="2024-12-31",
             form_type="10-K",
             exhibit_type="21",
             accession_number=accession,
@@ -950,6 +1197,45 @@ class TestSaveOutput:
 
         result_df = pd.read_parquet(pipeline.config.output_file)
         assert len(result_df) == 1
+
+    def test_legacy_parquet_without_column_gets_empty_strings_not_nulls(self, pipeline):
+        # Simulates a parquet written before period_of_report existed.
+        legacy_df = pd.DataFrame(
+            [
+                {
+                    "parent_cik": "0000000001",
+                    "accession_number": "LEGACY-ACC",
+                    "name": "Legacy Sub LLC",
+                    "location": "Delaware",
+                    "parent_state_of_incorporation": "DE",
+                }
+            ]
+        )
+        legacy_df.to_parquet(pipeline.config.output_file)
+
+        pipeline.save_output([self._make_subsidiary("Apple Operations International")])
+
+        result_df = pd.read_parquet(pipeline.config.output_file)
+        assert result_df["period_of_report"].isna().sum() == 0
+        legacy_row = result_df[result_df["accession_number"] == "LEGACY-ACC"].iloc[0]
+        assert legacy_row["period_of_report"] == ""
+
+    def test_legacy_merge_leaves_new_rows_populated(self, pipeline):
+        pd.DataFrame(
+            [{"parent_cik": "0000000001", "accession_number": "LEGACY-ACC", "name": "Legacy Sub"}]
+        ).to_parquet(pipeline.config.output_file)
+
+        pipeline.save_output([self._make_subsidiary("Apple Operations International")])
+
+        result_df = pd.read_parquet(pipeline.config.output_file)
+        new_row = result_df[result_df["name"] == "Apple Operations International"].iloc[0]
+        assert new_row["period_of_report"] == "2024-12-31"
+
+    def test_period_of_report_column_is_string_typed(self, pipeline):
+        pipeline.save_output([self._make_subsidiary("Apple Operations International")])
+
+        result_df = pd.read_parquet(pipeline.config.output_file)
+        assert all(isinstance(v, str) for v in result_df["period_of_report"])
 
     def test_output_contains_all_subsidiary_fields(self, pipeline):
         subsidiaries = [self._make_subsidiary("Apple Sales International")]
@@ -1008,6 +1294,7 @@ class TestSaveOutput:
                 name="Acme China Sub",
                 location="PRC",
                 filing_date="2024-01-01",
+                period_of_report="2024-12-31",
                 form_type="10-K",
                 exhibit_type="21",
                 accession_number="0000000001-24-000001",
@@ -1020,6 +1307,7 @@ class TestSaveOutput:
                 name="Acme Mexico Sub",
                 location="Mexico(2)",
                 filing_date="2024-01-01",
+                period_of_report="2024-12-31",
                 form_type="10-K",
                 exhibit_type="21",
                 accession_number="0000000001-24-000001",
@@ -1032,6 +1320,7 @@ class TestSaveOutput:
                 name="Acme Mystery Sub",
                 location="Unknown",
                 filing_date="2024-01-01",
+                period_of_report="2024-12-31",
                 form_type="10-K",
                 exhibit_type="21",
                 accession_number="0000000001-24-000001",
