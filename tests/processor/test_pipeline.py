@@ -67,7 +67,7 @@ def make_subsidiary(
     return Subsidiary(
         parent_cik=parent_cik,
         filing_date="2024-09-28",
-        period_of_report="2024-12-31",
+        report_date="2024-12-31",
         form_type="10-K",
         exhibit_type="21",
         accession_number=accession_number,
@@ -82,7 +82,7 @@ def make_filing(cik: str = "0000320193", accession_number: str = "0000320193-24-
     return Filing(
         cik=cik,
         filing_date="2024-09-28",
-        period_of_report="2024-12-31",
+        report_date="2024-12-31",
         form_type="10-K",
         accession_number=accession_number,
         primary_document="",
@@ -236,24 +236,24 @@ class TestReportDatesByAccession:
         }
 
 
-class TestPeriodOfReport:
-    """Tests for SubsidiaryPipeline._period_of_report()."""
+class TestReportDate:
+    """Tests for SubsidiaryPipeline._report_date()."""
 
     def test_prefers_the_manifest_report_date(self, pipeline):
         scraped = make_scraped_filing(report_date="2016-12-31")
 
-        assert pipeline._period_of_report(scraped) == "2016-12-31"
+        assert pipeline._report_date(scraped) == "2016-12-31"
 
     def test_returns_empty_when_cache_has_no_entry_for_the_cik(self, pipeline):
         scraped = make_scraped_filing(report_date="")
 
-        assert pipeline._period_of_report(scraped) == ""
+        assert pipeline._report_date(scraped) == ""
 
     def test_returns_empty_when_cik_is_cached_but_accession_is_not(self, pipeline):
         pipeline._report_date_cache["0000320193"] = {"OTHER-ACC": "2016-12-31"}
         scraped = make_scraped_filing(accession_number="ACC1", report_date="")
 
-        assert pipeline._period_of_report(scraped) == ""
+        assert pipeline._report_date(scraped) == ""
 
 
 class TestFetchCompanyMeta:
@@ -389,7 +389,7 @@ class TestLoadInput:
         assert filings[0].cik == "0000320193"
         assert len(filings[0].exhibit_documents) == 1
 
-    def test_copies_report_date_onto_period_of_report(self, pipeline, mocker):
+    def test_copies_report_date_onto_report_date(self, pipeline, mocker):
         mocker.patch(
             "idi_corporate_structure.pipeline.iter_filings_by_form_type",
             return_value=[make_scraped_filing(report_date="2016-12-31")],
@@ -398,9 +398,9 @@ class TestLoadInput:
 
         filings = pipeline.load_input()
 
-        assert filings[0].period_of_report == "2016-12-31"
+        assert filings[0].report_date == "2016-12-31"
 
-    def test_period_of_report_is_independent_of_filing_date(self, pipeline, mocker):
+    def test_report_date_is_independent_of_filing_date(self, pipeline, mocker):
         # A delinquent filer's submission date and reporting period differ by
         # years; the two fields must not be conflated.
         mocker.patch(
@@ -412,9 +412,9 @@ class TestLoadInput:
         filings = pipeline.load_input()
 
         assert filings[0].filing_date == "2017-07-03"
-        assert filings[0].period_of_report == "2014-05-31"
+        assert filings[0].report_date == "2014-05-31"
 
-    def test_co_registrant_accessions_keep_distinct_periods(self, pipeline, mocker):
+    def test_co_registrant_accessions_keep_distinct_report_dates(self, pipeline, mocker):
         # CIK 1583994 filed two 10-Ks on the same day; the higher accession is
         # the OLDER period, which is why accession order cannot be used.
         mocker.patch(
@@ -434,9 +434,9 @@ class TestLoadInput:
         )
         mocker.patch.object(pipeline, "_fetch_company_meta", return_value=CompanyMeta())
 
-        periods = {f.accession_number: f.period_of_report for f in pipeline.load_input()}
+        report_dates = {f.accession_number: f.report_date for f in pipeline.load_input()}
 
-        assert periods == {
+        assert report_dates == {
             "0001583994-17-000009": "2014-12-31",
             "0001574540-17-000007": "2016-12-31",
         }
@@ -462,7 +462,7 @@ class TestLoadInput:
         filings = pipeline.load_input()
 
         assert len(filings) == 1
-        assert filings[0].period_of_report == "2024-09-28"
+        assert filings[0].report_date == "2024-09-28"
 
     def test_fallback_issues_no_extra_sec_request(self, pipeline, mocker):
         # The submissions response is already fetched for company metadata, so
@@ -489,7 +489,7 @@ class TestLoadInput:
 
         # Both filings share a CIK: one request total, map built once and reused.
         assert pipeline.sec_client.query_endpoint.call_count == 1
-        assert [f.period_of_report for f in filings] == ["2023-12-31", "2022-12-31"]
+        assert [f.report_date for f in filings] == ["2023-12-31", "2022-12-31"]
 
     def test_manifest_report_date_wins_over_submissions_json(self, pipeline, mocker):
         mocker.patch(
@@ -504,9 +504,9 @@ class TestLoadInput:
 
         filings = pipeline.load_input()
 
-        assert filings[0].period_of_report == "2016-12-31"
+        assert filings[0].report_date == "2016-12-31"
 
-    def test_excludes_filing_with_no_period_in_either_source(self, pipeline, mocker):
+    def test_excludes_filing_with_no_report_date_in_either_source(self, pipeline, mocker):
         mocker.patch(
             "idi_corporate_structure.pipeline.iter_filings_by_form_type",
             return_value=[make_scraped_filing(accession_number="ACC1", report_date="")],
@@ -517,7 +517,7 @@ class TestLoadInput:
 
         assert filings == []
 
-    def test_records_missing_period_failure_keyed_on_accession(self, pipeline, mocker):
+    def test_records_missing_report_date_failure_keyed_on_accession(self, pipeline, mocker):
         mocker.patch(
             "idi_corporate_structure.pipeline.iter_filings_by_form_type",
             return_value=[
@@ -545,7 +545,7 @@ class TestLoadInput:
         filings = pipeline.load_input()
 
         assert len(filings) == 1
-        assert filings[0].period_of_report == "2020-12-31"
+        assert filings[0].report_date == "2020-12-31"
         assert pipeline.stats.failed_filings == 0
 
     def test_increments_total_filing_per_scraped_filing(self, pipeline, mocker):
@@ -1183,7 +1183,7 @@ class TestSaveOutput:
             name=name,
             location="Ireland",
             filing_date="2024-09-28",
-            period_of_report="2024-12-31",
+            report_date="2024-12-31",
             form_type="10-K",
             exhibit_type="21",
             accession_number=accession,
@@ -1199,7 +1199,7 @@ class TestSaveOutput:
         assert len(result_df) == 1
 
     def test_legacy_parquet_without_column_gets_empty_strings_not_nulls(self, pipeline):
-        # Simulates a parquet written before period_of_report existed.
+        # Simulates a parquet written before report_date existed.
         legacy_df = pd.DataFrame(
             [
                 {
@@ -1216,9 +1216,9 @@ class TestSaveOutput:
         pipeline.save_output([self._make_subsidiary("Apple Operations International")])
 
         result_df = pd.read_parquet(pipeline.config.output_file)
-        assert result_df["period_of_report"].isna().sum() == 0
+        assert result_df["report_date"].isna().sum() == 0
         legacy_row = result_df[result_df["accession_number"] == "LEGACY-ACC"].iloc[0]
-        assert legacy_row["period_of_report"] == ""
+        assert legacy_row["report_date"] == ""
 
     def test_legacy_merge_leaves_new_rows_populated(self, pipeline):
         pd.DataFrame(
@@ -1229,13 +1229,13 @@ class TestSaveOutput:
 
         result_df = pd.read_parquet(pipeline.config.output_file)
         new_row = result_df[result_df["name"] == "Apple Operations International"].iloc[0]
-        assert new_row["period_of_report"] == "2024-12-31"
+        assert new_row["report_date"] == "2024-12-31"
 
-    def test_period_of_report_column_is_string_typed(self, pipeline):
+    def test_report_date_column_is_string_typed(self, pipeline):
         pipeline.save_output([self._make_subsidiary("Apple Operations International")])
 
         result_df = pd.read_parquet(pipeline.config.output_file)
-        assert all(isinstance(v, str) for v in result_df["period_of_report"])
+        assert all(isinstance(v, str) for v in result_df["report_date"])
 
     def test_output_contains_all_subsidiary_fields(self, pipeline):
         subsidiaries = [self._make_subsidiary("Apple Sales International")]
@@ -1294,7 +1294,7 @@ class TestSaveOutput:
                 name="Acme China Sub",
                 location="PRC",
                 filing_date="2024-01-01",
-                period_of_report="2024-12-31",
+                report_date="2024-12-31",
                 form_type="10-K",
                 exhibit_type="21",
                 accession_number="0000000001-24-000001",
@@ -1307,7 +1307,7 @@ class TestSaveOutput:
                 name="Acme Mexico Sub",
                 location="Mexico(2)",
                 filing_date="2024-01-01",
-                period_of_report="2024-12-31",
+                report_date="2024-12-31",
                 form_type="10-K",
                 exhibit_type="21",
                 accession_number="0000000001-24-000001",
@@ -1320,7 +1320,7 @@ class TestSaveOutput:
                 name="Acme Mystery Sub",
                 location="Unknown",
                 filing_date="2024-01-01",
-                period_of_report="2024-12-31",
+                report_date="2024-12-31",
                 form_type="10-K",
                 exhibit_type="21",
                 accession_number="0000000001-24-000001",

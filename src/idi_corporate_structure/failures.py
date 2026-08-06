@@ -31,8 +31,8 @@ class FailureType(StrEnum):
     API_ERROR = "api_error"  # HTTP failure fetching filing document
     RATE_LIMIT = "rate_limit"  # SEC rate limit (429)
     NO_SUBSIDIARIES = "no_subsidiaries"  # No subsidiaries found for filing
-    MISSING_PERIOD_OF_REPORT = (
-        "missing_period_of_report"  # Neither the manifest nor the submissions JSON dates the filing
+    MISSING_REPORT_DATE = (
+        "missing_report_date"  # Neither the manifest nor the submissions JSON dates the filing
     )
 
 
@@ -50,7 +50,7 @@ class CorporateStructureFailureClassifier(FailureClassifier):
             FailureType.DOCUMENT_ERROR,
             FailureType.NO_OVERFLOW_FILINGS,
             FailureType.NO_SUBSIDIARIES,
-            FailureType.MISSING_PERIOD_OF_REPORT,
+            FailureType.MISSING_REPORT_DATE,
             FailureType.TRUNCATED_ERROR,
         }
     )

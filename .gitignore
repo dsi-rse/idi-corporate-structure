@@ -23,3 +23,6 @@ pulumi/.pulumi/
 .dolt/
 *.db
 .beads-credential-key
+
+# Local planning notes (refine/breakdown output)
+plans/

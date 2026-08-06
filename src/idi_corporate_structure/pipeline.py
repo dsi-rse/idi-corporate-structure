@@ -64,7 +64,7 @@ def report_dates_by_accession(submissions_data: dict) -> dict[str, str]:
     no filing arrays of their own; any that do carry the arrays are folded in,
     but overflow files are never fetched over the network.
 
-    Shared with the offline backfill of rows written before ``period_of_report``
+    Shared with the offline backfill of rows written before ``report_date``
     existed, so it takes a parsed response body rather than a CIK.
 
     Args:
@@ -274,7 +274,7 @@ class SubsidiaryPipeline(Pipeline):
         self._report_date_cache[cik] = report_dates_by_accession(data)
         return company_meta
 
-    def _period_of_report(self, scraped_filing: ScrapedFiling) -> str:
+    def _report_date(self, scraped_filing: ScrapedFiling) -> str:
         """Return the filing's reporting period, falling back to the submissions JSON.
 
         The scraped ``manifest.json`` is the primary source: ``idi-sec-scraper``
@@ -342,7 +342,7 @@ class SubsidiaryPipeline(Pipeline):
         ``NO_EXHIBIT_FOUND`` failures and excluded from the returned list, so
         the count reflects filings that actually have exhibit content to fetch.
         Filings that neither the scraped manifest nor the submissions JSON dates
-        are likewise excluded, as ``MISSING_PERIOD_OF_REPORT``.
+        are likewise excluded, as ``MISSING_REPORT_DATE``.
 
         Returns:
             A list of Filing objects
@@ -383,7 +383,7 @@ class SubsidiaryPipeline(Pipeline):
             filing = Filing(
                 cik=scraped_filing.cik,
                 filing_date=scraped_filing.filing_date,
-                period_of_report=self._period_of_report(scraped_filing),
+                report_date=self._report_date(scraped_filing),
                 form_type=scraped_filing.form_type,
                 accession_number=scraped_filing.accession_number,
                 primary_document=scraped_filing.index_url,
@@ -412,16 +412,16 @@ class SubsidiaryPipeline(Pipeline):
                 )
                 continue
 
-            if not filing.period_of_report:
+            if not filing.report_date:
                 # Neither the scraped manifest nor the submissions JSON dates this
                 # filing, so a row for it could only carry a null reporting period.
                 # Recorded as do-not-retry: re-reading the same two sources cannot
                 # produce a different answer.
                 self._record_failure(
                     (filing.cik, filing.accession_number),
-                    FailureType.MISSING_PERIOD_OF_REPORT,
+                    FailureType.MISSING_REPORT_DATE,
                     "warning",
-                    "No period of report for filing: %s - %s - %s (%s)",
+                    "No report date for filing: %s - %s - %s (%s)",
                     filing.cik,
                     filing.accession_number,
                     filing.filing_date,
@@ -746,7 +746,7 @@ class SubsidiaryPipeline(Pipeline):
         """Deduplicate and persist extracted subsidiaries as a Parquet file.
 
         Merges new rows with any existing parquet, drops duplicates keyed on
-        ``(parent_cik, accession_number, name)``, normalizes ``period_of_report``
+        ``(parent_cik, accession_number, name)``, normalizes ``report_date``
         to a string column, and stamps a UTC ``date_added`` column before writing.
 
         Args:
@@ -801,14 +801,14 @@ class SubsidiaryPipeline(Pipeline):
             subset=["parent_cik", "accession_number", "name"]
         )
 
-        # Rows written before period_of_report existed come back from the concat
+        # Rows written before report_date existed come back from the concat
         # as NaN, which would flip the column to object/float and write nulls.
         # Normalize to "" so the column stays string-typed across runs. This does
         # not date those rows — that is the offline backfill's job.
-        if "period_of_report" not in combined_subsidiaries_df.columns:
-            combined_subsidiaries_df["period_of_report"] = ""
-        combined_subsidiaries_df["period_of_report"] = (
-            combined_subsidiaries_df["period_of_report"].fillna("").astype(str).replace("nan", "")
+        if "report_date" not in combined_subsidiaries_df.columns:
+            combined_subsidiaries_df["report_date"] = ""
+        combined_subsidiaries_df["report_date"] = (
+            combined_subsidiaries_df["report_date"].fillna("").astype(str).replace("nan", "")
         )
 
         # Add a date_added column if it doesn't exist and set the value to the current UTC timestamp

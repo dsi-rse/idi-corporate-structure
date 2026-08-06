@@ -74,7 +74,7 @@ class Filing:
 
     cik: str
     filing_date: str  # date the filing was submitted to EDGAR
-    period_of_report: str  # fiscal period the filing covers, ISO YYYY-MM-DD
+    report_date: str  # fiscal period the filing covers, ISO YYYY-MM-DD
     form_type: str
     accession_number: str
     primary_document: str
@@ -157,7 +157,7 @@ class Subsidiary:
 
     parent_cik: str
     filing_date: str  # date the filing was submitted to EDGAR
-    period_of_report: str  # fiscal period the exhibit describes, ISO YYYY-MM-DD
+    report_date: str  # fiscal period the exhibit describes, ISO YYYY-MM-DD
     form_type: str
     exhibit_type: str
     accession_number: str

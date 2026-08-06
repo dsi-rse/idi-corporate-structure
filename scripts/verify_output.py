@@ -454,8 +454,8 @@ def _fetch_report_dates(cik: str, sec_client: SecClient) -> dict[str, str]:
     return report_dates_by_accession(result.get("data", {}))
 
 
-def check_period(ctx: VerifyContext) -> list[str]:
-    """Verify period_of_report is present and agrees with EDGAR.
+def check_report_date(ctx: VerifyContext) -> list[str]:
+    """Verify report_date is present and agrees with EDGAR.
 
     Catches:
       - Rows whose reporting period disagrees with EDGAR's reportDate for the
@@ -465,26 +465,26 @@ def check_period(ctx: VerifyContext) -> list[str]:
         before the column existed are legitimately blank until they are
         backfilled offline.
     """
-    _section("Period of report")
+    _section("Report date")
     failures: list[str] = []
     subs = ctx.df
 
-    if "period_of_report" not in subs.columns:
-        log.error("%s Output has no period_of_report column", _FAIL)
-        return ["missing period_of_report column"]
+    if "report_date" not in subs.columns:
+        log.error("%s Output has no report_date column", _FAIL)
+        return ["missing report_date column"]
 
-    blank = subs["period_of_report"].isna() | (subs["period_of_report"].astype(str) == "")
+    blank = subs["report_date"].isna() | (subs["report_date"].astype(str) == "")
     if blank.any():
         n = int(blank.sum())
         log.warning(
-            "%s %d of %d row(s) have a blank period_of_report (expected for rows written "
+            "%s %d of %d row(s) have a blank report_date (expected for rows written "
             "before the column existed; clears once they are backfilled)",
             _WARN,
             n,
             len(subs),
         )
     else:
-        log.info("%s All %d rows have a non-empty period_of_report", _PASS, len(subs))
+        log.info("%s All %d rows have a non-empty report_date", _PASS, len(subs))
 
     # Spot-check the CIKs that motivated the column: a delinquent filer and a
     # co-registrant filing whose accession lives under another CIK's folder.
@@ -499,23 +499,23 @@ def check_period(ctx: VerifyContext) -> list[str]:
             continue
 
         for accession, group in rows.groupby("accession_number"):
-            actual = str(group["period_of_report"].iloc[0])
+            actual = str(group["report_date"].iloc[0])
             want = expected.get(str(accession))
             if want is None:
                 log.warning("%s EDGAR has no reportDate for %s", _WARN, accession)
             elif not actual:
-                log.warning("%s %s has a blank period (EDGAR: %s)", _WARN, accession, want)
+                log.warning("%s %s has a blank report_date (EDGAR: %s)", _WARN, accession, want)
             elif actual != want:
                 log.error(
-                    "%s %s has period_of_report=%s but EDGAR reports %s",
+                    "%s %s has report_date=%s but EDGAR reports %s",
                     _FAIL,
                     accession,
                     actual,
                     want,
                 )
-                failures.append(f"{accession}: period {actual} != EDGAR {want}")
+                failures.append(f"{accession}: report_date {actual} != EDGAR {want}")
             else:
-                log.info("%s %s period_of_report=%s matches EDGAR", _PASS, accession, actual)
+                log.info("%s %s report_date=%s matches EDGAR", _PASS, accession, actual)
 
     return failures
 
@@ -541,9 +541,9 @@ CHECKS: list[Check] = [
         fn=check_location,
     ),
     Check(
-        name="period",
-        description="Verify period_of_report is present and matches EDGAR's reportDate",
-        fn=check_period,
+        name="report_date",
+        description="Verify report_date is present and matches EDGAR's reportDate",
+        fn=check_report_date,
     ),
     Check(
         name="failures",
