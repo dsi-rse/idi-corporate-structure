@@ -94,6 +94,7 @@ class TestGptExtractor:
         assert s.parent_cik == sample_filing.cik
         assert s.parent_name == sample_filing.company_name
         assert s.filing_date == sample_filing.filing_date
+        assert s.report_date == sample_filing.report_date
         assert s.form_type == sample_filing.form_type
         assert s.accession_number == sample_filing.accession_number
 

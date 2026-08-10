@@ -55,6 +55,39 @@ class CompanyMetaFetchError(Exception):
     """
 
 
+def report_dates_by_accession(submissions_data: dict) -> dict[str, str]:
+    """Map ``accession_number`` to ``reportDate`` from a SEC submissions JSON body.
+
+    ``filings.recent`` stores parallel arrays, so ``accessionNumber[i]`` and
+    ``reportDate[i]`` describe the same filing. Entries under ``filings.files``
+    are normally just references to overflow files (name/count/date-range) with
+    no filing arrays of their own; any that do carry the arrays are folded in,
+    but overflow files are never fetched over the network.
+
+    Shared with the offline backfill of rows written before ``report_date``
+    existed, so it takes a parsed response body rather than a CIK.
+
+    Args:
+        submissions_data: Parsed body of ``data.sec.gov/submissions/CIK*.json``.
+
+    Returns:
+        Mapping of accession number to ISO ``YYYY-MM-DD`` report date. Filings
+        with a blank or missing report date are omitted.
+    """
+    filings = submissions_data.get("filings", {})
+    blocks = [filings.get("recent", {})]
+    blocks.extend(entry for entry in filings.get("files", []) or [] if isinstance(entry, dict))
+
+    mapping: dict[str, str] = {}
+    for block in blocks:
+        accessions = block.get("accessionNumber") or []
+        report_dates = block.get("reportDate") or []
+        # zip() stops at the shorter list, so a truncated array cannot misalign
+        # the pairs — it only drops the unmatched tail.
+        mapping.update({a: r for a, r in zip(accessions, report_dates) if a and r})
+    return mapping
+
+
 class Pipeline(ABC):
     """Baseline class for processing piplines."""
 
@@ -174,6 +207,10 @@ class SubsidiaryPipeline(Pipeline):
         self._results_lock = threading.Lock()
         self.rows = []
         self._company_meta_cache: dict[str, CompanyMeta] = {}
+        # accession_number -> reportDate, per CIK. Populated from the same
+        # submissions response as the company metadata, so recovering a missing
+        # period costs no extra request.
+        self._report_date_cache: dict[str, dict[str, str]] = {}
 
     def _load_processed_accessions(self) -> set[str]:
         """Return accession numbers already present in the output parquet file.
@@ -234,7 +271,30 @@ class SubsidiaryPipeline(Pipeline):
             exchanges=tuple(e or "" for e in data.get("exchanges") or ()),
         )
         self._company_meta_cache[cik] = company_meta
+        self._report_date_cache[cik] = report_dates_by_accession(data)
         return company_meta
+
+    def _report_date(self, scraped_filing: ScrapedFiling) -> str:
+        """Return the filing's reporting period, falling back to the submissions JSON.
+
+        The scraped ``manifest.json`` is the primary source: ``idi-sec-scraper``
+        writes ``report_date`` from the EDGAR index page's "Period of Report"
+        field on both the historical and daily paths. It is blank only when the
+        index page carried no such field, in which case the submissions response
+        already fetched for this CIK is consulted.
+
+        Args:
+            scraped_filing: Manifest for the filing being loaded.
+
+        Returns:
+            ISO ``YYYY-MM-DD`` report date, or ``""`` if neither source has one.
+        """
+        if scraped_filing.report_date:
+            return scraped_filing.report_date
+
+        return self._report_date_cache.get(scraped_filing.cik, {}).get(
+            scraped_filing.accession_number, ""
+        )
 
     @staticmethod
     def _select_exhibit_documents(
@@ -281,6 +341,8 @@ class SubsidiaryPipeline(Pipeline):
         Filings with no matching exhibit documents are recorded as
         ``NO_EXHIBIT_FOUND`` failures and excluded from the returned list, so
         the count reflects filings that actually have exhibit content to fetch.
+        Filings that neither the scraped manifest nor the submissions JSON dates
+        are likewise excluded, as ``MISSING_REPORT_DATE``.
 
         Returns:
             A list of Filing objects
@@ -321,6 +383,7 @@ class SubsidiaryPipeline(Pipeline):
             filing = Filing(
                 cik=scraped_filing.cik,
                 filing_date=scraped_filing.filing_date,
+                report_date=self._report_date(scraped_filing),
                 form_type=scraped_filing.form_type,
                 accession_number=scraped_filing.accession_number,
                 primary_document=scraped_filing.index_url,
@@ -341,6 +404,24 @@ class SubsidiaryPipeline(Pipeline):
                     FailureType.NO_EXHIBIT_FOUND,
                     "warning",
                     "No exhibit found for filing: %s - %s - %s (%s)",
+                    filing.cik,
+                    filing.accession_number,
+                    filing.filing_date,
+                    scraped_filing.index_url,
+                    stat_keys=("failed_filings",),
+                )
+                continue
+
+            if not filing.report_date:
+                # Neither the scraped manifest nor the submissions JSON dates this
+                # filing, so a row for it could only carry a null reporting period.
+                # Recorded as do-not-retry: re-reading the same two sources cannot
+                # produce a different answer.
+                self._record_failure(
+                    (filing.cik, filing.accession_number),
+                    FailureType.MISSING_REPORT_DATE,
+                    "warning",
+                    "No report date for filing: %s - %s - %s (%s)",
                     filing.cik,
                     filing.accession_number,
                     filing.filing_date,
@@ -665,8 +746,8 @@ class SubsidiaryPipeline(Pipeline):
         """Deduplicate and persist extracted subsidiaries as a Parquet file.
 
         Merges new rows with any existing parquet, drops duplicates keyed on
-        ``(parent_cik, accession_number, name)``, and stamps a UTC ``date_added``
-        column before writing.
+        ``(parent_cik, accession_number, name)``, normalizes ``report_date``
+        to a string column, and stamps a UTC ``date_added`` column before writing.
 
         Args:
             processed_list: List of :class:`Subsidiary` objects returned by
@@ -718,6 +799,16 @@ class SubsidiaryPipeline(Pipeline):
         # Drop duplicate rows keyed on (parent_cik, accession_number, name)
         combined_subsidiaries_df = combined_subsidiaries_df.drop_duplicates(
             subset=["parent_cik", "accession_number", "name"]
+        )
+
+        # Rows written before report_date existed come back from the concat
+        # as NaN, which would flip the column to object/float and write nulls.
+        # Normalize to "" so the column stays string-typed across runs. This does
+        # not date those rows — that is the offline backfill's job.
+        if "report_date" not in combined_subsidiaries_df.columns:
+            combined_subsidiaries_df["report_date"] = ""
+        combined_subsidiaries_df["report_date"] = (
+            combined_subsidiaries_df["report_date"].fillna("").astype(str).replace("nan", "")
         )
 
         # Add a date_added column if it doesn't exist and set the value to the current UTC timestamp

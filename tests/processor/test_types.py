@@ -140,10 +140,14 @@ class TestFilingDataclass:
         assert sample_filing.company_name == "APPLE INC"
         assert sample_filing.company.state_of_incorporation == "CA"
 
+    def test_filing_carries_report_date(self, sample_filing):
+        assert sample_filing.report_date == "2024-12-31"
+
     def test_filing_equality(self):
         f1 = Filing(
             cik="001",
             filing_date="2024-01-01",
+            report_date="2024-12-31",
             form_type="10-K",
             accession_number="001-24-000001",
             primary_document="",
@@ -151,6 +155,7 @@ class TestFilingDataclass:
         f2 = Filing(
             cik="001",
             filing_date="2024-01-01",
+            report_date="2024-12-31",
             form_type="10-K",
             accession_number="001-24-000001",
             primary_document="",
@@ -161,6 +166,7 @@ class TestFilingDataclass:
         filing = Filing(
             cik="001",
             filing_date="2024-01-01",
+            report_date="2024-12-31",
             form_type="10-K",
             accession_number="001-24-000001",
             primary_document="",
@@ -171,6 +177,7 @@ class TestFilingDataclass:
         filing = Filing(
             cik="001",
             filing_date="2024-01-01",
+            report_date="2024-12-31",
             form_type="10-K",
             accession_number="001-24-000001",
             primary_document="",
@@ -185,6 +192,7 @@ class TestFilingExhibitType:
         return Filing(
             cik="",
             filing_date="",
+            report_date="2024-12-31",
             form_type=form_type,
             accession_number="",
             primary_document="",
@@ -223,6 +231,7 @@ class TestSubsidiaryDataclass:
             name="Apple Operations International",
             location="Ireland",
             filing_date="2024-09-28",
+            report_date="2024-12-31",
             form_type="10-K",
             exhibit_type="21",
             accession_number="0000320193-24-000123",
@@ -231,3 +240,4 @@ class TestSubsidiaryDataclass:
         assert sub.parent_cik == "0000320193"
         assert sub.name == "Apple Operations International"
         assert sub.location == "Ireland"
+        assert sub.report_date == "2024-12-31"

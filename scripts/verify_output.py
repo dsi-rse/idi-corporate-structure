@@ -31,8 +31,10 @@ from collections.abc import Callable
 
 import pandas as pd
 import requests
-from idi_corporate_structure.common.api import SecClient
-from idi_corporate_structure.processor.extractor import _normalize, html_to_text
+from idi_ftm2j_shared.api import SecClient
+
+from idi_corporate_structure.extractor import _normalize, html_to_text
+from idi_corporate_structure.pipeline import report_dates_by_accession
 
 _DEFAULT_SAMPLE_SIZE = 30
 _LOCATION_EMPTY_RATE_THRESHOLD = 0.15
@@ -442,6 +444,82 @@ def check_failures(ctx: VerifyContext) -> list[str]:
     return issues
 
 
+def _fetch_report_dates(cik: str, sec_client: SecClient) -> dict[str, str]:
+    """Return the accession -> reportDate map for one CIK, or {} if unavailable."""
+    url = f"https://data.sec.gov/submissions/CIK{str(int(cik)).zfill(10)}.json"
+    result = sec_client.query_endpoint(sec_url=url)
+    if "error" in result:
+        log.warning("%s Could not fetch submissions JSON for CIK %s", _WARN, cik)
+        return {}
+    return report_dates_by_accession(result.get("data", {}))
+
+
+def check_report_date(ctx: VerifyContext) -> list[str]:
+    """Verify report_date is present and agrees with EDGAR.
+
+    Catches:
+      - Rows whose reporting period disagrees with EDGAR's reportDate for the
+        same accession — the failure mode that would silently misdate a
+        subsidiary list.
+      - Blank periods, reported as a warning rather than a failure: rows written
+        before the column existed are legitimately blank until they are
+        backfilled offline.
+    """
+    _section("Report date")
+    failures: list[str] = []
+    subs = ctx.df
+
+    if "report_date" not in subs.columns:
+        log.error("%s Output has no report_date column", _FAIL)
+        return ["missing report_date column"]
+
+    blank = subs["report_date"].isna() | (subs["report_date"].astype(str) == "")
+    if blank.any():
+        n = int(blank.sum())
+        log.warning(
+            "%s %d of %d row(s) have a blank report_date (expected for rows written "
+            "before the column existed; clears once they are backfilled)",
+            _WARN,
+            n,
+            len(subs),
+        )
+    else:
+        log.info("%s All %d rows have a non-empty report_date", _PASS, len(subs))
+
+    # Spot-check the CIKs that motivated the column: a delinquent filer and a
+    # co-registrant filing whose accession lives under another CIK's folder.
+    for cik in ("1583994", "857501"):
+        rows = subs[subs["parent_cik"].astype(str).str.lstrip("0") == cik]
+        if rows.empty:
+            log.info("%s CIK %s not present in output — skipping spot check", _INFO, cik)
+            continue
+
+        expected = _fetch_report_dates(cik, ctx.sec_client)
+        if not expected:
+            continue
+
+        for accession, group in rows.groupby("accession_number"):
+            actual = str(group["report_date"].iloc[0])
+            want = expected.get(str(accession))
+            if want is None:
+                log.warning("%s EDGAR has no reportDate for %s", _WARN, accession)
+            elif not actual:
+                log.warning("%s %s has a blank report_date (EDGAR: %s)", _WARN, accession, want)
+            elif actual != want:
+                log.error(
+                    "%s %s has report_date=%s but EDGAR reports %s",
+                    _FAIL,
+                    accession,
+                    actual,
+                    want,
+                )
+                failures.append(f"{accession}: report_date {actual} != EDGAR {want}")
+            else:
+                log.info("%s %s report_date=%s matches EDGAR", _PASS, accession, actual)
+
+    return failures
+
+
 # ---------------------------------------------------------------------------
 # Check registry — controls ordering and --list-checks output
 # ---------------------------------------------------------------------------
@@ -461,6 +539,11 @@ CHECKS: list[Check] = [
         name="location",
         description="Report empty subsidiary location rate and parent_location distribution",
         fn=check_location,
+    ),
+    Check(
+        name="report_date",
+        description="Verify report_date is present and matches EDGAR's reportDate",
+        fn=check_report_date,
     ),
     Check(
         name="failures",
@@ -517,11 +600,10 @@ def create_args() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--parquet", required=True, help="Path to latest.parquet")
-    parser.add_argument("--failures", required=True, help="Path to failures.json")
+    parser.add_argument("--parquet", help="Path to latest.parquet")
+    parser.add_argument("--failures", help="Path to failures.json")
     parser.add_argument(
         "--user-agent",
-        required=True,
         metavar="STRING",
         help="User-Agent header sent with SEC EDGAR requests (required by EDGAR policy)",
     )
@@ -585,6 +667,18 @@ def main() -> None:
             print(f"  {check.name:<15}  {check.description}")
         print()
         sys.exit(0)
+
+    missing = [
+        flag
+        for flag, value in (
+            ("--parquet", args.parquet),
+            ("--failures", args.failures),
+            ("--user-agent", args.user_agent),
+        )
+        if not value
+    ]
+    if missing:
+        parser.error(f"the following arguments are required: {', '.join(missing)}")
 
     # Load the results parquet file
     log.info("\nLoading %s ...", args.parquet)
