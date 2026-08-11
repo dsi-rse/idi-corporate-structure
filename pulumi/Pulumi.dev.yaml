@@ -10,5 +10,5 @@ config:
   idi:input_sample_size: "0"
   idi:openai_model: "gpt-4.1-nano"
   idi:cron_corporate_structure: "cron(0 2 * * ? *)"
-  idi:schedule_enabled: "false"
+  idi:schedule_enabled: "true"
 encryptionsalt: v1:uKxVenI8WgM=:v1:5ajyGs6YbyaNcfbG:py0R99X0KpYgqChIsEdY4/BjuXryLA==
