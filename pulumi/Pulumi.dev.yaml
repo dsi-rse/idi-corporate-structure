@@ -1,6 +1,7 @@
 # Committed variable config for the dev stack.
 config:
   idi:sec_prefix: "sec"
+  idi:database_prefix: "database"
   idi:sec_user_agent: "DSI Core Facility dsicorefacility_project8@uchicago.edu"
   idi:cpu: "1024"
   idi:memory: "4096"

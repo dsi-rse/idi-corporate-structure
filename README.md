@@ -200,17 +200,20 @@ The pipeline runs as an **ECS Fargate task** scheduled by **EventBridge Schedule
 
 ### S3 File Layout
 
-Everything lives in a single externally-managed S3 bucket (name from SSM). SEC input is written by the upstream sec-scraper under `{sec_prefix}/` (default `sec/`); this processor writes its output under `{app}/`:
+Everything lives in a single externally-managed S3 bucket (name from SSM). SEC input is written by the upstream sec-scraper under `{sec_prefix}/` (default `sec/`). The Parquet output is published under `{database_prefix}/{app}/` (default `database/corporate-structure/`) alongside other datasets; the failure registry stays under `{app}/` since it is operational state rather than published data:
 
 ```
 {bucket}/
   {sec_prefix}/                 ← input, written by the sec-scraper
     manifest.parquet            ← filing index the orchestrator reads (--sec-bucket-prefix)
     ...                         ← scraped exhibit documents
+  {database_prefix}/{app}/
+    latest.parquet              ← output
   {app}/
-    output/latest.parquet ← output
     failures/failures.json      ← permanent failure registry
 ```
+
+`latest.parquet` is both the published dataset and the pipeline's dedupe cache — each run reads it back to skip filings already processed and to merge new rows into the historical table (see `_load_processed_accessions` and `save_output` in `pipeline.py`). Changing `idi:database_prefix` or `idi:app_name` therefore requires copying the existing object to the new key before the next run; without it, every filing looks unprocessed and the file is rebuilt from that run's date window alone.
 
 ### Deployment
 
@@ -235,6 +238,7 @@ uv run --group pulumi pulumi up
 | `idi:openai_api_key` | — | OpenAI API key (secret; stored in Secrets Manager) |
 | `idi:sec_user_agent` | — | Required. SEC EDGAR contact string (`Name email`) |
 | `idi:sec_prefix` | `sec` | Prefix within the shared bucket where the sec-scraper wrote SEC data; combined with the bucket name to form `--sec-bucket-prefix` |
+| `idi:database_prefix` | `database` | Prefix within the shared bucket for published datasets; output is written to `{bucket}/{database_prefix}/{app_name}/latest.parquet` |
 | `idi:openai_model` | `gpt-4.1-nano` | OpenAI model ID for extraction |
 | `idi:cron_corporate_structure` | `cron(0 2 * * ? *)` | EventBridge schedule expression |
 | `idi:schedule_enabled` | `false` | Enable the EventBridge schedule |
