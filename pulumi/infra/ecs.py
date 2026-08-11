@@ -47,7 +47,14 @@ openai_model = config.config.get("openai_model") or "gpt-4.1-nano"
 # resolves the date range from that prefix's manifest.parquet.
 sec_prefix = config.config.get("sec_prefix") or "sec"
 sec_bucket_prefix = f"{config.bucket_name}/{sec_prefix}"
-output_file = f"s3://{config.bucket_name}/{config.app_name}/output/latest.parquet"
+# The Parquet output is published under the shared bucket's database prefix
+# (consumed by downstream readers), while the failure registry stays under the
+# app's own prefix — it is operational state, not published data. Note the
+# pipeline also reads latest.parquet back as its dedupe cache (see
+# pipeline._load_processed_accessions), so moving this path without copying the
+# existing object makes every filing look unprocessed on the next run.
+database_prefix = config.config.get("database_prefix") or "database"
+output_file = f"s3://{config.bucket_name}/{database_prefix}/{config.app_name}/latest.parquet"
 failure_file = f"s3://{config.bucket_name}/{config.app_name}/failures/failures.json"
 
 # Container definition as JSON (required by aws.ecs.TaskDefinition)

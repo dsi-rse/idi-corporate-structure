@@ -38,6 +38,8 @@ pulumi.export("ecs_cluster_arn", ecs.cluster.arn)
 pulumi.export("ecs_cluster_name", ecs.cluster.name)
 pulumi.export("task_definition_arn", ecs.task_definition.arn)
 pulumi.export("log_group_name", logs.log_group.name)
+pulumi.export("output_file", ecs.output_file)
+pulumi.export("failure_file", ecs.failure_file)
 
 # Secrets (SSM SecureString — value set out-of-band)
 pulumi.export("openai_api_key_param_arn", secrets.openai_api_key_param.arn)
