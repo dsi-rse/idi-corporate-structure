@@ -141,7 +141,7 @@ The container runs `--daily` mode by default (see `compose.yml`), reading SEC in
 | `AWS_REGION` | `us-east-2` | AWS region for S3 and CloudWatch |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` | — | AWS credentials for S3 (omit when using an instance role) |
 | `CLOUDWATCH_LOGS_ENABLED` | `false` | Enable CloudWatch log shipping |
-| `ORCHESTRATOR_IMAGE` | `ghcr.io/dsi-clinic/idi-corporate-structure-orchestrator:latest` | Image to pull on EC2 (ignored when building locally) |
+| `ORCHESTRATOR_IMAGE` | `ghcr.io/dsi-rse/idi-corporate-structure-orchestrator:latest` | Image to pull on EC2 (ignored when building locally) |
 
 ### Run
 
@@ -385,7 +385,7 @@ This package (`src/idi_corporate_structure/`):
 | `normalization.py` | Parent/subsidiary location normalization helpers |
 | `types.py` | `Filing`, `Subsidiary`, `CompanyMeta`, `PipelineConfig`, and `PipelineStats` dataclasses |
 
-Shared infrastructure lives in the [`idi-ftm2j-shared`](https://github.com/dsi-clinic/idi-ftm2j-shared) package: `api.ApiClient`/`SecClient` (retries, rate limiting), `failures.FailureRegistry`, `logs` (CloudWatch), `storage.load_content`, and `sec.iter_filings_by_form_type` (reads the scraper manifest).
+Shared infrastructure lives in the [`idi-ftm2j-shared`](https://github.com/dsi-rse/idi-ftm2j-shared) package: `api.ApiClient`/`SecClient` (retries, rate limiting), `failures.FailureRegistry`, `logs` (CloudWatch), `storage.load_content`, and `sec.iter_filings_by_form_type` (reads the scraper manifest).
 
 ### Failure Types
 
@@ -411,7 +411,7 @@ Shared infrastructure lives in the [`idi-ftm2j-shared`](https://github.com/dsi-c
 
 ## Development cycle
 
-Documentation governing all processors: https://github.com/dsi-clinic/idi-ftm2j-shared/tree/main#development--contributing
+Documentation governing all processors: https://github.com/dsi-rse/idi-ftm2j-shared/tree/main#development--contributing
 
 ### CI/CD specifics
 
