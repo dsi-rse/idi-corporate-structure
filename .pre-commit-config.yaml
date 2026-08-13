@@ -1,5 +1,5 @@
 # Local quality gate mirroring the CI "Lint" job in
-# dsi-clinic/idi-ftm2j-shared/.github/workflows/pipeline-checks.yml:
+# dsi-rse/idi-ftm2j-shared/.github/workflows/pipeline-checks.yml:
 #   - ruff check .          (lint)
 #   - ruff format --check . (format)
 # Rules are read from pyproject.toml ([tool.ruff]). Pinned to the ruff
