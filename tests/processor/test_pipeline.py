@@ -142,19 +142,25 @@ class TestSelectExhibitDocuments:
 
 
 class TestShouldSkip:
-    """Tests for SubsidiaryPipeline._should_skip()."""
+    """Tests for SubsidiaryPipeline._should_skip().
 
-    def test_false_when_not_processed_or_failed(self, pipeline, sample_filing):
-        assert pipeline._should_skip(sample_filing, processed_accessions=set()) is False
+    Takes the scraped manifest, not a built Filing: the check runs before the
+    company-metadata fetch so an already-settled accession costs no SEC request.
+    """
 
-    def test_true_when_accession_already_processed(self, pipeline, sample_filing):
-        processed = {sample_filing.accession_number}
-        assert pipeline._should_skip(sample_filing, processed_accessions=processed) is True
+    def test_false_when_not_processed_or_failed(self, pipeline):
+        assert pipeline._should_skip(make_scraped_filing(), processed_accessions=set()) is False
 
-    def test_true_when_in_failure_registry(self, pipeline, sample_filing):
-        pipeline.failure_registry._entries.add((sample_filing.cik, sample_filing.accession_number))
+    def test_true_when_accession_already_processed(self, pipeline):
+        scraped = make_scraped_filing()
+        processed = {scraped.accession_number}
+        assert pipeline._should_skip(scraped, processed_accessions=processed) is True
 
-        assert pipeline._should_skip(sample_filing, processed_accessions=set()) is True
+    def test_true_when_in_failure_registry(self, pipeline):
+        scraped = make_scraped_filing()
+        pipeline.failure_registry._entries.add((scraped.cik, scraped.accession_number))
+
+        assert pipeline._should_skip(scraped, processed_accessions=set()) is True
 
 
 # ── _load_processed_accessions ───────────────────────────────────────────────
@@ -421,6 +427,36 @@ class TestLoadInput:
 
         scan_logs = [c for c in info_spy.call_args_list if "Scanned" in c.args[0]]
         assert len(scan_logs) == 2
+
+    def test_skipped_filing_costs_no_company_meta_request(self, pipeline, mocker):
+        """The resume check runs before any SEC request for the filing."""
+        mocker.patch(
+            "idi_corporate_structure.pipeline.iter_filings_by_form_type",
+            return_value=[make_scraped_filing(accession_number="ACC1")],
+        )
+        mocker.patch.object(pipeline, "_load_processed_accessions", return_value={"ACC1"})
+        meta = mocker.patch.object(pipeline, "_fetch_company_meta", return_value=CompanyMeta())
+
+        filings = pipeline.load_input()
+
+        assert filings == []
+        assert pipeline.stats.skipped_filings == 1
+        meta.assert_not_called()
+
+    def test_scan_progress_counts_the_filing_from_the_same_iteration(self, pipeline, mocker):
+        """The 'with exhibits' count includes the filing just classified, not the previous one."""
+        pipeline._LOAD_LOG_EVERY = 1
+        mocker.patch(
+            "idi_corporate_structure.pipeline.iter_filings_by_form_type",
+            return_value=[make_scraped_filing()],
+        )
+        mocker.patch.object(pipeline, "_fetch_company_meta", return_value=CompanyMeta())
+        info_spy = mocker.spy(pipeline.logger, "info")
+
+        pipeline.load_input()
+
+        scan_logs = [c for c in info_spy.call_args_list if "Scanned" in c.args[0]]
+        assert scan_logs[0].args[1:3] == (1, 1)  # 1 scanned, 1 with exhibits — not (1, 0)
 
     def test_copies_report_date_onto_report_date(self, pipeline, mocker):
         mocker.patch(
@@ -1143,6 +1179,27 @@ class TestFetchExhibit:
 
         assert result == []
         mock_load.assert_not_called()
+
+    def test_records_failure_when_no_document_has_an_s3_key(self, pipeline, sample_filing, mocker):
+        """An unstored exhibit must be registered, not skipped silently.
+
+        Without a registry entry the filing writes no rows, so it appears in
+        neither the output nor the failure file and gets refetched on every run.
+        """
+        sample_filing.exhibit_documents = (make_scraped_document(s3_key=""),)
+        mocker.patch("idi_corporate_structure.pipeline.load_content")
+
+        assert pipeline._fetch_exhibit(sample_filing) == []
+        assert (sample_filing.cik, sample_filing.accession_number) in pipeline.failure_registry
+
+    def test_unstored_exhibit_is_skipped_on_the_next_run(self, pipeline, sample_filing, mocker):
+        """NO_EXHIBIT_CONTENT is do-not-retry, so the filing settles instead of looping."""
+        sample_filing.exhibit_documents = (make_scraped_document(s3_key=""),)
+        mocker.patch("idi_corporate_structure.pipeline.load_content")
+
+        pipeline._fetch_exhibit(sample_filing)
+
+        assert pipeline._should_skip(make_scraped_filing(), processed_accessions=set())
 
     def test_records_failure_when_content_missing(self, pipeline, sample_filing, mocker):
         sample_filing.exhibit_documents = (make_scraped_document(),)

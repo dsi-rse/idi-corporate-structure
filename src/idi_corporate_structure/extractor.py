@@ -238,7 +238,7 @@ class GptExtractor(Extractor):
         chunk_subs_list: list[list[dict]],
         company_name: str,
         doc_url: str,
-    ) -> None:
+    ) -> int:
         """Re-extract chunks whose yield is a sharp outlier vs their siblings.
 
         A per-chunk yield well below the sibling median signals mid-document
@@ -254,8 +254,7 @@ class GptExtractor(Extractor):
         recovery.
 
         Mutates ``chunk_subs_list`` in place, replacing each outlier chunk's
-        entry with its merged (original + recovered) subsidiaries. Returns
-        nothing.
+        entry with its merged (original + recovered) subsidiaries.
 
         Args:
             chunks: The chunk texts, in order.
@@ -263,12 +262,17 @@ class GptExtractor(Extractor):
                 ``chunks``; modified in place for outlier chunks.
             company_name: Filing company name, for log lines.
             doc_url: SEC URL of the exhibit, for log lines.
+
+        Returns:
+            The number of chunks that were re-extracted, so the caller can
+            summarize them in one line per document instead of per chunk.
         """
         if len(chunks) < self._MIN_CHUNKS_FOR_RETRY:
-            return
+            return 0
 
         yields = [self._chunk_yield(c, subs) for c, subs in zip(chunks, chunk_subs_list)]
         last_index = len(chunks) - 1
+        retried = 0
 
         for i, (chunk, subs) in enumerate(zip(chunks, chunk_subs_list)):
             sibling_median = statistics.median([y for j, y in enumerate(yields) if j != i])
@@ -302,6 +306,9 @@ class GptExtractor(Extractor):
                 doc_url,
             )
             chunk_subs_list[i] = merged
+            retried += 1
+
+        return retried
 
     def _summarize_chunks(
         self, doc_text: str, company_name: str, doc_url: str
@@ -344,7 +351,17 @@ class GptExtractor(Extractor):
             self._log_chunk(chunk, chunk_subs, company_name, doc_url, i, len(chunks))
             chunk_subs_list.append(chunk_subs)
 
-        self._retry_outlier_chunks(chunks, chunk_subs_list, company_name, doc_url)
+        # Per-chunk outlier detail is DEBUG; one summary line per document keeps the
+        # data-quality signal visible at INFO-level volume rather than per chunk.
+        retried = self._retry_outlier_chunks(chunks, chunk_subs_list, company_name, doc_url)
+        if retried:
+            self._logger.warning(
+                "%s: %d/%d chunks re-extracted as low-yield outliers @ %s",
+                company_name,
+                retried,
+                len(chunks),
+                doc_url,
+            )
 
         all_subs = [sub for chunk_subs in chunk_subs_list for sub in chunk_subs]
         return all_subs, len(chunks)
@@ -534,8 +551,14 @@ class GptExtractor(Extractor):
             grounded_subsidiaries.append(sub)
 
         if ungrounded_name:
-            self._logger.debug(
-                "Dropped %d ungrounded subsidiaries from %s", ungrounded_name, doc_url
+            # WARNING, unlike the per-subsidiary DEBUG lines above: a document
+            # dropping rows is a real signal about how the extraction is doing, and
+            # one line per document keeps that affordable to leave on by default.
+            self._logger.warning(
+                "Dropped %d of %d ungrounded subsidiaries from %s",
+                ungrounded_name,
+                len(subsidiaries),
+                doc_url,
             )
 
         return grounded_subsidiaries, ungrounded_name, ungrounded_location

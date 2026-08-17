@@ -172,14 +172,17 @@ class Pipeline(ABC):
         self.logger.info("Located %d filings with exhibits to process", len(input_data))
 
         if input_data:
-            results = self.process(input_data)
-            self.save_output(results)
+            # Not the full result set: anything a checkpoint already flushed is
+            # persisted and dropped from the buffer, so this is only the
+            # unflushed tail that the final save still has to write.
+            unflushed_results = self.process(input_data)
+            self.save_output(unflushed_results)
             self.display_stats()
         else:
             self.logger.info("No input data found, skipping pipeline")
 
         end_time = datetime.datetime.now(datetime.UTC)
-        self.logger.info("Elasped time: %s", end_time - start_time)
+        self.logger.info("Elapsed time: %s", end_time - start_time)
 
 
 class _ResultSink:
@@ -399,11 +402,16 @@ class SubsidiaryPipeline(Pipeline):
             if re.sub(r"[^0-9a-z]", "", d.type.lower()).startswith(token)
         )
 
-    def _should_skip(self, filing: Filing, processed_accessions: set[str]) -> bool:
+    def _should_skip(self, filing: ScrapedFiling, processed_accessions: set[str]) -> bool:
         """Return True if the filing was already processed or previously failed.
 
+        Takes the scraped manifest rather than a built :class:`Filing` so the
+        check can run before any SEC request is made for the filing — the CIK
+        and accession number are all it needs, and both are already on the
+        manifest.
+
         Args:
-            filing: Filing being considered for processing.
+            filing: Scraped manifest of the filing being considered.
             processed_accessions: Accession numbers already present in the
                 output file.
 
@@ -445,78 +453,18 @@ class SubsidiaryPipeline(Pipeline):
         filings = []
         for scraped_filing in scraped_filings:
             scanned = self.stats.increment("total_filing")
+
+            filing = self._build_filing(scraped_filing, processed_accessions)
+            if filing:
+                filings.append(filing)
+
+            # Logged after the filing has been classified, so the "with exhibits"
+            # count covers every filing counted by ``scanned`` rather than
+            # trailing it by one.
             if scanned % self._LOAD_LOG_EVERY == 0:
                 self.logger.info(
                     "Scanned %d filings (%d with exhibits so far)", scanned, len(filings)
                 )
-
-            try:
-                company_meta = self._fetch_company_meta(scraped_filing.cik)
-            except CompanyMetaFetchError:
-                # Retryable failure: not persisted to the registry, so the filing is
-                # neither written to output nor skipped on the next run.
-                self._record_failure(
-                    (scraped_filing.cik, scraped_filing.accession_number),
-                    FailureType.API_ERROR,
-                    "warning",
-                    "Failed to fetch company metadata for CIK %s - %s - will retry next run",
-                    scraped_filing.cik,
-                    scraped_filing.accession_number,
-                    stat_keys=("failed_filings",),
-                )
-                continue
-
-            filing = Filing(
-                cik=scraped_filing.cik,
-                filing_date=scraped_filing.filing_date,
-                report_date=self._report_date(scraped_filing),
-                form_type=scraped_filing.form_type,
-                accession_number=scraped_filing.accession_number,
-                primary_document=scraped_filing.index_url,
-                company_name=scraped_filing.company_name,
-                company=company_meta,
-            )
-            filing.exhibit_documents = self._select_exhibit_documents(
-                scraped_filing, filing.exhibit_type
-            )
-
-            if self._should_skip(filing, processed_accessions):
-                self.stats.increment("skipped_filings")
-                continue
-
-            if not filing.exhibit_documents:
-                self._record_failure(
-                    (filing.cik, filing.accession_number),
-                    FailureType.NO_EXHIBIT_FOUND,
-                    "debug",
-                    "No exhibit found for filing: %s - %s - %s (%s)",
-                    filing.cik,
-                    filing.accession_number,
-                    filing.filing_date,
-                    scraped_filing.index_url,
-                    stat_keys=("failed_filings",),
-                )
-                continue
-
-            if not filing.report_date:
-                # Neither the scraped manifest nor the submissions JSON dates this
-                # filing, so a row for it could only carry a null reporting period.
-                # Recorded as do-not-retry: re-reading the same two sources cannot
-                # produce a different answer.
-                self._record_failure(
-                    (filing.cik, filing.accession_number),
-                    FailureType.MISSING_REPORT_DATE,
-                    "warning",
-                    "No report date for filing: %s - %s - %s (%s)",
-                    filing.cik,
-                    filing.accession_number,
-                    filing.filing_date,
-                    scraped_filing.index_url,
-                    stat_keys=("failed_filings",),
-                )
-                continue
-
-            filings.append(filing)
 
         self._total_filings = len(filings)
         self.logger.info(
@@ -527,6 +475,98 @@ class SubsidiaryPipeline(Pipeline):
         )
 
         return filings
+
+    def _build_filing(
+        self, scraped_filing: ScrapedFiling, processed_accessions: set[str]
+    ) -> Filing | None:
+        """Build a processable :class:`Filing`, or return None to exclude it.
+
+        Single exit point per scanned filing, so :meth:`load_input` can log scan
+        progress once per iteration regardless of which exclusion fired. Every
+        exclusion either records a failure or increments a stat, exactly as the
+        inline checks it replaces did.
+
+        The resume check runs first, before any SEC request: an accession already
+        in the output file or the failure registry needs neither company metadata
+        nor a report date, so skipping early avoids a submissions-JSON round trip
+        per already-processed filing.
+
+        Args:
+            scraped_filing: Manifest of the filing being considered.
+            processed_accessions: Accession numbers already present in the output
+                file.
+
+        Returns:
+            The built Filing, or None if it was skipped, failed metadata fetch,
+            has no matching exhibit documents, or has no resolvable report date.
+        """
+        if self._should_skip(scraped_filing, processed_accessions):
+            self.stats.increment("skipped_filings")
+            return None
+
+        try:
+            company_meta = self._fetch_company_meta(scraped_filing.cik)
+        except CompanyMetaFetchError:
+            # Retryable failure: not persisted to the registry, so the filing is
+            # neither written to output nor skipped on the next run.
+            self._record_failure(
+                (scraped_filing.cik, scraped_filing.accession_number),
+                FailureType.API_ERROR,
+                "warning",
+                "Failed to fetch company metadata for CIK %s - %s - will retry next run",
+                scraped_filing.cik,
+                scraped_filing.accession_number,
+                stat_keys=("failed_filings",),
+            )
+            return None
+
+        filing = Filing(
+            cik=scraped_filing.cik,
+            filing_date=scraped_filing.filing_date,
+            report_date=self._report_date(scraped_filing),
+            form_type=scraped_filing.form_type,
+            accession_number=scraped_filing.accession_number,
+            primary_document=scraped_filing.index_url,
+            company_name=scraped_filing.company_name,
+            company=company_meta,
+        )
+        filing.exhibit_documents = self._select_exhibit_documents(
+            scraped_filing, filing.exhibit_type
+        )
+
+        if not filing.exhibit_documents:
+            self._record_failure(
+                (filing.cik, filing.accession_number),
+                FailureType.NO_EXHIBIT_FOUND,
+                "debug",
+                "No exhibit found for filing: %s - %s - %s (%s)",
+                filing.cik,
+                filing.accession_number,
+                filing.filing_date,
+                scraped_filing.index_url,
+                stat_keys=("failed_filings",),
+            )
+            return None
+
+        if not filing.report_date:
+            # Neither the scraped manifest nor the submissions JSON dates this
+            # filing, so a row for it could only carry a null reporting period.
+            # Recorded as do-not-retry: re-reading the same two sources cannot
+            # produce a different answer.
+            self._record_failure(
+                (filing.cik, filing.accession_number),
+                FailureType.MISSING_REPORT_DATE,
+                "warning",
+                "No report date for filing: %s - %s - %s (%s)",
+                filing.cik,
+                filing.accession_number,
+                filing.filing_date,
+                scraped_filing.index_url,
+                stat_keys=("failed_filings",),
+            )
+            return None
+
+        return filing
 
     def _record_failure(
         self,
@@ -731,6 +771,20 @@ class SubsidiaryPipeline(Pipeline):
         exhibit_content = []
         for doc in filing.exhibit_documents:
             if not doc.s3_key:
+                # The scraper listed the document but never stored it, so there is
+                # nothing to fetch. Recorded rather than skipped silently: without a
+                # registry entry this filing would write no rows, land in neither the
+                # output nor the failure file, and be rescanned and refetched on every
+                # subsequent run. NO_EXHIBIT_CONTENT is do-not-retry, so it settles.
+                self._record_failure(
+                    (filing.cik, filing.accession_number),
+                    FailureType.NO_EXHIBIT_CONTENT,
+                    "warning",
+                    "Exhibit %s - %s - %s has no stored content to fetch.",
+                    doc.filename,
+                    filing.cik,
+                    filing.accession_number,
+                )
                 continue
 
             try:

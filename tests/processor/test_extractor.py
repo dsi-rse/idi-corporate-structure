@@ -289,6 +289,53 @@ class TestGptExtractor:
         assert len(result) == 1
         assert result[0].name == "Apple Operations LLC"
 
+    def test_drops_logged_as_one_warning_per_document(self, sample_filing, mocker):
+        """Per-subsidiary drops stay DEBUG; the document gets one WARNING summary."""
+        extractor = GptExtractor(openai_api_key="fake-key")
+        mocker.patch.object(
+            extractor._openai_client,
+            "query_endpoint",
+            return_value=_make_openai_response(
+                [
+                    {
+                        "name": "Apple Operations LLC",
+                        "location": "Delaware",
+                        "source_quote": _QUOTE_APPLE_OPS,
+                    },
+                    {"name": "Ghost Corp", "location": "Nevada", "source_quote": "Ghost"},
+                    {"name": "Phantom Inc", "location": "Nevada", "source_quote": "Phantom"},
+                ]
+            ),
+        )
+        warn_spy = mocker.spy(extractor._logger, "warning")
+
+        extractor.extract(sample_filing, make_exhibit_response())
+
+        warn_spy.assert_called_once()
+        assert "Dropped %d of %d ungrounded subsidiaries" in warn_spy.call_args.args[0]
+        assert warn_spy.call_args.args[1:3] == (2, 3)
+
+    def test_no_drop_warning_when_everything_grounds(self, sample_filing, mocker):
+        extractor = GptExtractor(openai_api_key="fake-key")
+        mocker.patch.object(
+            extractor._openai_client,
+            "query_endpoint",
+            return_value=_make_openai_response(
+                [
+                    {
+                        "name": "Apple Operations LLC",
+                        "location": "Delaware",
+                        "source_quote": _QUOTE_APPLE_OPS,
+                    }
+                ]
+            ),
+        )
+        warn_spy = mocker.spy(extractor._logger, "warning")
+
+        extractor.extract(sample_filing, make_exhibit_response())
+
+        warn_spy.assert_not_called()
+
     def test_empty_source_quote_kept_when_name_in_doc(self, sample_filing, mocker):
         """An empty source_quote is not a drop reason when the name is grounded."""
         extractor = GptExtractor(openai_api_key="fake-key")
@@ -874,6 +921,56 @@ class TestRetryOutlierChunks:
         mocker.patch.object(extractor, "_summarize", side_effect=RuntimeError("api error"))
 
         assert extractor._reextract_outlier(self._chunk("Row", 60)) == []
+
+    def test_returns_retried_chunk_count(self, mocker):
+        """The count is what lets the caller summarize per document, not per chunk."""
+        extractor = GptExtractor(openai_api_key="fake-key")
+        chunks = [self._chunk("A", 10), self._chunk("B", 10), self._chunk("C", 10)]
+        subs = [
+            [self._sub(f"A{i} LLC") for i in range(9)],
+            [self._sub(f"B{i} LLC") for i in range(3)],  # outlier
+            [self._sub(f"C{i} LLC") for i in range(9)],
+        ]
+        mocker.patch.object(extractor, "_reextract_outlier", return_value=[])
+
+        assert extractor._retry_outlier_chunks(chunks, subs, "ACME", "url") == 1
+
+    def test_returns_zero_when_nothing_retried(self, mocker):
+        extractor = GptExtractor(openai_api_key="fake-key")
+        chunks = [self._chunk("A", 10), self._chunk("B", 10), self._chunk("C", 10)]
+        subs = [[self._sub(f"{p}{i} LLC") for i in range(9)] for p in "ABC"]
+        mocker.patch.object(extractor, "_reextract_outlier")
+
+        assert extractor._retry_outlier_chunks(chunks, subs, "ACME", "url") == 0
+
+    def test_summary_warning_logged_once_per_document(self, mocker):
+        """Per-chunk detail stays DEBUG; the document gets one WARNING with the count."""
+        extractor = GptExtractor(openai_api_key="fake-key")
+        chunks = [self._chunk("A", 10), self._chunk("B", 10), self._chunk("C", 10)]
+        mocker.patch("idi_corporate_structure.extractor._chunk_document", return_value=chunks)
+        mocker.patch.object(extractor, "_retry_outlier_chunks", return_value=2)
+        mocker.patch.object(
+            extractor, "_summarize", return_value={"subsidiaries": [self._sub("A0 LLC")]}
+        )
+        warn_spy = mocker.spy(extractor._logger, "warning")
+
+        extractor._summarize_chunks(self._chunk("A", 30), "ACME", "url")
+
+        warn_spy.assert_called_once()
+        assert "chunks re-extracted as low-yield outliers" in warn_spy.call_args.args[0]
+        assert warn_spy.call_args.args[2:4] == (2, 3)  # 2 of 3 chunks retried
+
+    def test_no_summary_warning_when_no_outliers(self, mocker):
+        extractor = GptExtractor(openai_api_key="fake-key")
+        mocker.patch.object(extractor, "_retry_outlier_chunks", return_value=0)
+        mocker.patch.object(
+            extractor, "_summarize", return_value={"subsidiaries": [self._sub("A0 LLC")]}
+        )
+        warn_spy = mocker.spy(extractor._logger, "warning")
+
+        extractor._summarize_chunks(self._chunk("A", 30), "ACME", "url")
+
+        warn_spy.assert_not_called()
 
 
 class TestWindowedSubsequenceGrounding:
