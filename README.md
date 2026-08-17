@@ -6,7 +6,7 @@ Automated pipeline for extracting subsidiary information from SEC 10-K (Exhibit 
 
 This processor consumes SEC filing data already collected by the upstream **sec-scraper** (stored in S3), and performs three stages:
 
-1. **Load** — read the scraper's `manifest.parquet` from the SEC bucket for the requested date range (or the most recent filings via `--daily`) to enumerate 10-K-family (Exhibit 21) and 20-F-family (Exhibit 8) filings; fetch per-company metadata (state of incorporation, business address, tickers, exchanges) from the SEC submissions API
+1. **Load** — read the scraper's `manifest.parquet` from the SEC bucket for the requested date range (or the most recent filings via `--daily`) to enumerate 10-K-family (Exhibit 21) and 20-F-family (Exhibit 8) filings, capturing each filing's submission date and its reporting period (`report_date`); fetch per-company metadata (state of incorporation, business address, tickers, exchanges) from the SEC submissions API
 2. **Retrieval** — load each filing's already-scraped exhibit content from S3 (HTML, plain text, or PDF)
 3. **Extraction** — pass exhibit content to `gpt-4.1-nano` using structured output to parse subsidiary names and incorporation locations. Each subsidiary name is grounded against the exhibit text — exact match, then a punctuation-insensitive match, then a windowed in-order token match for names split across table columns — and names not found in the source are dropped to guard against hallucinations. Output is structured `Subsidiary` records written to Parquet.
 
@@ -16,15 +16,26 @@ Processing tracks permanent failures to disk so interrupted runs do not re-attem
 
 ```
 {output_file}   # Parquet — one row per subsidiary, with parent-company metadata
-                # columns: parent_cik, filing_date, form_type, exhibit_type,
-                #   accession_number, exhibit_url, name, location, parent_name,
-                #   parent_state_of_incorporation, parent_business_* (street/city/state/
-                #   zip/country/country_code), parent_tickers, parent_exchanges,
-                #   source_quote, date_added
+                # columns: parent_cik, filing_date, report_date, form_type,
+                #   exhibit_type, accession_number, exhibit_url, name, location,
+                #   parent_name, parent_state_of_incorporation, parent_business_*
+                #   (street/city/state/zip/country/country_code), parent_tickers,
+                #   parent_exchanges, source_quote, date_added
 failures.json   # permanent failures keyed by (cik, accession_number)
 ```
 
 Output and failure paths support local directories or S3 URLs (`s3://bucket/path`). SEC input is always read from S3 via `--sec-bucket-prefix`.
+
+#### `filing_date` vs `report_date`
+
+These are different dates and are not interchangeable:
+
+- **`filing_date`** — when the filing was submitted to EDGAR.
+- **`report_date`** — the fiscal period the exhibit actually describes (ISO `YYYY-MM-DD`, taken from the filing index page's *Period of Report*).
+
+Delinquent filers submit several years of 10-Ks on the **same day**, each with its own Exhibit 21, so `filing_date` cannot identify which reporting year a subsidiary list covers. Accession number does not resolve it either — its prefix is a filer ID, not a sequence. For CIK 1583994, both accessions were filed 2017-02-24, and the *higher* one (`0001583994-17-000009`) is the older FY2014 exhibit, while `0001574540-17-000007` is FY2016. Select on `report_date`.
+
+Rows written before this column was added carry an empty string rather than a null; backfilling them is tracked separately.
 
 ---
 
@@ -130,7 +141,7 @@ The container runs `--daily` mode by default (see `compose.yml`), reading SEC in
 | `AWS_REGION` | `us-east-2` | AWS region for S3 and CloudWatch |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` | — | AWS credentials for S3 (omit when using an instance role) |
 | `CLOUDWATCH_LOGS_ENABLED` | `false` | Enable CloudWatch log shipping |
-| `ORCHESTRATOR_IMAGE` | `ghcr.io/dsi-clinic/idi-corporate-structure-orchestrator:latest` | Image to pull on EC2 (ignored when building locally) |
+| `ORCHESTRATOR_IMAGE` | `ghcr.io/dsi-rse/idi-corporate-structure-orchestrator:latest` | Image to pull on EC2 (ignored when building locally) |
 
 ### Run
 
@@ -189,17 +200,20 @@ The pipeline runs as an **ECS Fargate task** scheduled by **EventBridge Schedule
 
 ### S3 File Layout
 
-Everything lives in a single externally-managed S3 bucket (name from SSM). SEC input is written by the upstream sec-scraper under `{sec_prefix}/` (default `sec/`); this processor writes its output under `{app}/`:
+Everything lives in a single externally-managed S3 bucket (name from SSM). SEC input is written by the upstream sec-scraper under `{sec_prefix}/` (default `sec/`). The Parquet output is published under `{database_prefix}/{app}/` (default `database/corporate-structure/`) alongside other datasets; the failure registry stays under `{app}/` since it is operational state rather than published data:
 
 ```
 {bucket}/
   {sec_prefix}/                 ← input, written by the sec-scraper
     manifest.parquet            ← filing index the orchestrator reads (--sec-bucket-prefix)
     ...                         ← scraped exhibit documents
+  {database_prefix}/{app}/
+    latest.parquet              ← output
   {app}/
-    output/latest.parquet ← output
     failures/failures.json      ← permanent failure registry
 ```
+
+`latest.parquet` is both the published dataset and the pipeline's dedupe cache — each run reads it back to skip filings already processed and to merge new rows into the historical table (see `_load_processed_accessions` and `save_output` in `pipeline.py`). Changing `idi:database_prefix` or `idi:app_name` therefore requires copying the existing object to the new key before the next run; without it, every filing looks unprocessed and the file is rebuilt from that run's date window alone.
 
 ### Deployment
 
@@ -224,6 +238,7 @@ uv run --group pulumi pulumi up
 | `idi:openai_api_key` | — | OpenAI API key (secret; stored in Secrets Manager) |
 | `idi:sec_user_agent` | — | Required. SEC EDGAR contact string (`Name email`) |
 | `idi:sec_prefix` | `sec` | Prefix within the shared bucket where the sec-scraper wrote SEC data; combined with the bucket name to form `--sec-bucket-prefix` |
+| `idi:database_prefix` | `database` | Prefix within the shared bucket for published datasets; output is written to `{bucket}/{database_prefix}/{app_name}/latest.parquet` |
 | `idi:openai_model` | `gpt-4.1-nano` | OpenAI model ID for extraction |
 | `idi:cron_corporate_structure` | `cron(0 2 * * ? *)` | EventBridge schedule expression |
 | `idi:schedule_enabled` | `false` | Enable the EventBridge schedule |
@@ -370,7 +385,7 @@ This package (`src/idi_corporate_structure/`):
 | `normalization.py` | Parent/subsidiary location normalization helpers |
 | `types.py` | `Filing`, `Subsidiary`, `CompanyMeta`, `PipelineConfig`, and `PipelineStats` dataclasses |
 
-Shared infrastructure lives in the [`idi-ftm2j-shared`](https://github.com/dsi-clinic/idi-ftm2j-shared) package: `api.ApiClient`/`SecClient` (retries, rate limiting), `failures.FailureRegistry`, `logs` (CloudWatch), `storage.load_content`, and `sec.iter_filings_by_form_type` (reads the scraper manifest).
+Shared infrastructure lives in the [`idi-ftm2j-shared`](https://github.com/dsi-rse/idi-ftm2j-shared) package: `api.ApiClient`/`SecClient` (retries, rate limiting), `failures.FailureRegistry`, `logs` (CloudWatch), `storage.load_content`, and `sec.iter_filings_by_form_type` (reads the scraper manifest).
 
 ### Failure Types
 
@@ -385,6 +400,7 @@ Shared infrastructure lives in the [`idi-ftm2j-shared`](https://github.com/dsi-c
 | `no_exhibit_content` | No | Exhibit returned no content |
 | `document_error` | No | Exhibit document is too long to process |
 | `no_subsidiaries` | No | No subsidiaries found for the filing |
+| `missing_report_date` | No | Neither the scraped manifest nor the SEC submissions JSON dates the filing |
 | `truncated_error` | No | Model response cut off at the output token limit |
 | `extraction_failed` | Yes | GPT returned no structured data |
 | `timeout_error` | Yes | OpenAI API timed out |
@@ -395,7 +411,7 @@ Shared infrastructure lives in the [`idi-ftm2j-shared`](https://github.com/dsi-c
 
 ## Development cycle
 
-Documentation governing all processors: https://github.com/dsi-clinic/idi-ftm2j-shared/tree/main#development--contributing
+Documentation governing all processors: https://github.com/dsi-rse/idi-ftm2j-shared/tree/main#development--contributing
 
 ### CI/CD specifics
 

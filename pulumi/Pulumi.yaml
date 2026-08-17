@@ -57,6 +57,13 @@ config:
       form the orchestrator's --sec-bucket-prefix (bucket/prefix).
     default: "sec"
 
+  idi:database_prefix:
+    description: >-
+      Key prefix within the shared bucket where published datasets live. The
+      processor writes its Parquet output to
+      {bucket}/{database_prefix}/{app_name}/latest.parquet.
+    default: "database"
+
   idi:log_retention_days:
     description: CloudWatch log group retention in days
     default: "30"

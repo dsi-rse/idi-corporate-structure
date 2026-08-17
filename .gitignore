@@ -18,3 +18,11 @@ logs/
 pulumi/venv/
 pulumi/__pycache__/
 pulumi/.pulumi/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+
+# Local planning notes (refine/breakdown output)
+plans/

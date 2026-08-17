@@ -4,7 +4,7 @@ services:
   # Corporate structure pipeline
   # ---------------------------------------------------------------------------
   orchestrator:
-    image: ${ORCHESTRATOR_IMAGE:-ghcr.io/dsi-clinic/idi-corporate-structure-orchestrator:latest}
+    image: ${ORCHESTRATOR_IMAGE:-ghcr.io/dsi-rse/idi-corporate-structure-orchestrator:latest}
     container_name: idi-corporate-structure-orchestrator
 
     environment:

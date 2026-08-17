@@ -73,7 +73,8 @@ class Filing:
     """Represents a single SEC 10-K filing with its metadata and document URLs."""
 
     cik: str
-    filing_date: str
+    filing_date: str  # date the filing was submitted to EDGAR
+    report_date: str  # fiscal period the filing covers, ISO YYYY-MM-DD
     form_type: str
     accession_number: str
     primary_document: str
@@ -163,7 +164,8 @@ class Subsidiary:
     """A single subsidiary entity extracted from an Exhibit 21 document."""
 
     parent_cik: str
-    filing_date: str
+    filing_date: str  # date the filing was submitted to EDGAR
+    report_date: str  # fiscal period the exhibit describes, ISO YYYY-MM-DD
     form_type: str
     exhibit_type: str
     accession_number: str

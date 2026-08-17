@@ -34,6 +34,7 @@ def sample_20f_filing() -> Filing:
     return Filing(
         cik="0001913847",
         filing_date="2025-07-30",
+        report_date="2024-12-31",
         form_type="20-F",
         accession_number="0001628280-25-036727",
         primary_document=(
@@ -49,6 +50,7 @@ def sample_filing() -> Filing:
     return Filing(
         cik="0000320193",
         filing_date="2024-09-28",
+        report_date="2024-12-31",
         form_type="10-K",
         accession_number="0000320193-24-000123",
         primary_document=(

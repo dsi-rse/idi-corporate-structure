@@ -1,6 +1,6 @@
 # PR quality gate. Thin caller of the shared composition pipeline-checks.yml
 # (lint, test, security, pulumi preview), pinned to an exact release of
-# dsi-clinic/idi-ftm2j-shared. Bump the @vX.Y.Z pin to upgrade.
+# dsi-rse/idi-ftm2j-shared. Bump the @vX.Y.Z pin to upgrade.
 name: Checks
 
 on:
@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   checks:
-    uses: dsi-clinic/idi-ftm2j-shared/.github/workflows/pipeline-checks.yml@v0.1.12
+    uses: dsi-rse/idi-ftm2j-shared/.github/workflows/pipeline-checks.yml@v0.1.12
     secrets: inherit
     with:
       app-name: corporate-structure
