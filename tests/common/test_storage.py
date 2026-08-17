@@ -102,9 +102,8 @@ class TestOpenZip:
         with zipfile.ZipFile(zip_path, "w") as zf:
             zf.writestr("data.json", json.dumps(payload))
 
-        with open_zip(str(zip_path)) as zf:
-            with zf.open("data.json") as f:
-                data = json.load(f)
+        with open_zip(str(zip_path)) as zf, zf.open("data.json") as f:
+            data = json.load(f)
 
         assert data == {"hello": "world"}
 
@@ -126,9 +125,8 @@ class TestOpenZip:
         # Verify the headers are forwarded — we just check smart_open was called
         # with transport_params containing the headers
         # zip read may fail on the mock — we only care about the call args
-        with contextlib.suppress(Exception):
-            with open_zip(str(zip_path), headers=headers):
-                pass
+        with contextlib.suppress(Exception), open_zip(str(zip_path), headers=headers):
+            pass
 
         mock_open.assert_called_once_with(
             str(zip_path), "rb", transport_params={"headers": headers}
@@ -147,8 +145,7 @@ class TestOpenZip:
         mock_open.return_value.__enter__ = lambda s: mock_file
         mock_open.return_value.__exit__ = MagicMock(return_value=False)
 
-        with contextlib.suppress(Exception):
-            with open_zip(str(zip_path)):
-                pass
+        with contextlib.suppress(Exception), open_zip(str(zip_path)):
+            pass
 
         mock_open.assert_called_once_with(str(zip_path), "rb", transport_params={})

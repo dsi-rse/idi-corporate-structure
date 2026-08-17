@@ -50,7 +50,7 @@ def fetch(user_agent: str) -> str:
     """Fetch the SEC EDGAR state/country code page and return its HTML."""
     if not any(SEC_URL.startswith(scheme) for scheme in _PERMITTED_SCHEMES):
         raise ValueError(f"Unexpected URL scheme: {SEC_URL}")
-    req = urllib.request.Request(SEC_URL, headers={"User-Agent": user_agent})  # noqa: S310
+    req = urllib.request.Request(SEC_URL, headers={"User-Agent": user_agent})
     with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
         return resp.read().decode("utf-8")
 

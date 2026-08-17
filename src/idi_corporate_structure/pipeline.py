@@ -4,11 +4,13 @@
 import dataclasses
 import datetime
 import io
+import logging
 import os
 import queue
 import re
 import threading
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from itertools import islice
 
 # Third party imports
@@ -164,28 +166,109 @@ class Pipeline(ABC):
         Returns:
             None
         """
-        start_time = datetime.datetime.now()
+        start_time = datetime.datetime.now(datetime.UTC)
 
         input_data = self.load_input()
         self.logger.info("Located %d filings with exhibits to process", len(input_data))
 
         if input_data:
-            results = self.process(input_data)
-            self.save_output(results)
+            # Not the full result set: anything a checkpoint already flushed is
+            # persisted and dropped from the buffer, so this is only the
+            # unflushed tail that the final save still has to write.
+            unflushed_results = self.process(input_data)
+            self.save_output(unflushed_results)
             self.display_stats()
         else:
             self.logger.info("No input data found, skipping pipeline")
 
-        end_time = datetime.datetime.now()
-        self.logger.info("Elasped time: %s", end_time - start_time)
+        end_time = datetime.datetime.now(datetime.UTC)
+        self.logger.info("Elapsed time: %s", end_time - start_time)
+
+
+class _ResultSink:
+    """Owns the extracted-results buffer and its checkpoint lifecycle.
+
+    Encapsulates the mutable results list so it is never shared with or returned to
+    the caller directly: the results worker feeds it via :meth:`add` / :meth:`checkpoint`,
+    and :meth:`process` collects the unflushed remainder via :meth:`drain` once that
+    worker has joined. Single-consumer by contract — only the results worker calls
+    :meth:`add`/:meth:`checkpoint`, and :meth:`drain` runs after it has exited — so the
+    lockless extend/flush/clear is safe as long as that invariant holds.
+    """
+
+    def __init__(
+        self,
+        flush: Callable[[list[Subsidiary]], None],
+        logger: logging.Logger,
+        total: int,
+    ) -> None:
+        """Initialize the sink.
+
+        Args:
+            flush: Callable that persists a list of subsidiaries (e.g.
+                :meth:`SubsidiaryPipeline.save_output`).
+            logger: Logger for checkpoint progress/failure lines.
+            total: Total documents to extract, for the checkpoint log line.
+        """
+        self._buffer: list[Subsidiary] = []
+        self._flush = flush
+        self._logger = logger
+        self._total = total
+
+    def add(self, batch: list[Subsidiary]) -> None:
+        """Accumulate one processed document's extracted subsidiaries."""
+        self._buffer.extend(batch)
+
+    def checkpoint(self, extracted: int) -> None:
+        """Flush the buffer to the output, dropping it from memory on success.
+
+        Keeps the buffer bounded (~checkpoint interval) instead of growing to millions
+        of rows over a run. The flush merges with the existing output, so flushed rows
+        are not lost. A failed write is logged and swallowed, and the buffer is kept so
+        its rows retry on the next checkpoint or the final :meth:`drain`.
+
+        Args:
+            extracted: Documents processed so far, for the log line.
+        """
+        if not self._buffer:
+            return
+        try:
+            self._logger.info(
+                "Checkpointing %d subsidiaries at %d / %d filings",
+                len(self._buffer),
+                extracted,
+                self._total,
+            )
+            self._flush(self._buffer)
+            self._buffer = []
+        except Exception:
+            self._logger.exception(
+                "Checkpoint write failed at %d documents; keeping buffer for retry", extracted
+            )
+
+    def drain(self) -> list[Subsidiary]:
+        """Return the rows not yet flushed and detach them from the sink.
+
+        Called by :meth:`process` after the results worker has joined, so there is no
+        concurrent mutation. Returns the tail accumulated since the last checkpoint
+        (or the full set when checkpointing is disabled) for the final save.
+        """
+        remaining, self._buffer = self._buffer, []
+        return remaining
 
 
 class SubsidiaryPipeline(Pipeline):
     """Pipeline that fetches Exhibit 21 filings from SEC EDGAR and extracts subsidiary data."""
 
     CIK_JSON_URL = "https://data.sec.gov/submissions"
-    _INPUT_SAMPLE_SIZE = int(os.environ.get("INPUT_SAMPLE_SIZE", 0))
+    _INPUT_SAMPLE_SIZE = int(os.environ.get("INPUT_SAMPLE_SIZE", "0"))
     _LOG_EVERY = 5
+    # Coarser cadence for the input scan: it sweeps every candidate filing
+    # (~100k for a full historical range), far more than the documents extracted.
+    _LOAD_LOG_EVERY = 1000
+    # Enqueued after all extraction tasks to tell the single results worker to
+    # finish draining and exit.
+    _RESULTS_SENTINEL = object()
 
     def __init__(
         self, config: PipelineConfig, sec_client: SecClient, extractor: GptExtractor
@@ -204,8 +287,10 @@ class SubsidiaryPipeline(Pipeline):
             classifier=CorporateStructureFailureClassifier(),
             flush_every=config.failure_flush_every,
         )
-        self._results_lock = threading.Lock()
-        self.rows = []
+        # Total filings to process, known once load_input has selected exhibits.
+        # Used as the fixed denominator in progress logs. Filings (not documents)
+        # are the unit of work so a filing's results are always flushed together.
+        self._total_filings = 0
         self._company_meta_cache: dict[str, CompanyMeta] = {}
         # accession_number -> reportDate, per CIK. Populated from the same
         # submissions response as the company metadata, so recovering a missing
@@ -317,11 +402,16 @@ class SubsidiaryPipeline(Pipeline):
             if re.sub(r"[^0-9a-z]", "", d.type.lower()).startswith(token)
         )
 
-    def _should_skip(self, filing: Filing, processed_accessions: set[str]) -> bool:
+    def _should_skip(self, filing: ScrapedFiling, processed_accessions: set[str]) -> bool:
         """Return True if the filing was already processed or previously failed.
 
+        Takes the scraped manifest rather than a built :class:`Filing` so the
+        check can run before any SEC request is made for the filing — the CIK
+        and accession number are all it needs, and both are already on the
+        manifest.
+
         Args:
-            filing: Filing being considered for processing.
+            filing: Scraped manifest of the filing being considered.
             processed_accessions: Accession numbers already present in the
                 output file.
 
@@ -362,77 +452,121 @@ class SubsidiaryPipeline(Pipeline):
 
         filings = []
         for scraped_filing in scraped_filings:
-            self.stats.increment("total_filing")
+            scanned = self.stats.increment("total_filing")
 
-            try:
-                company_meta = self._fetch_company_meta(scraped_filing.cik)
-            except CompanyMetaFetchError:
-                # Retryable failure: not persisted to the registry, so the filing is
-                # neither written to output nor skipped on the next run.
-                self._record_failure(
-                    (scraped_filing.cik, scraped_filing.accession_number),
-                    FailureType.API_ERROR,
-                    "warning",
-                    "Failed to fetch company metadata for CIK %s - %s - will retry next run",
-                    scraped_filing.cik,
-                    scraped_filing.accession_number,
-                    stat_keys=("failed_filings",),
+            filing = self._build_filing(scraped_filing, processed_accessions)
+            if filing:
+                filings.append(filing)
+
+            # Logged after the filing has been classified, so the "with exhibits"
+            # count covers every filing counted by ``scanned`` rather than
+            # trailing it by one.
+            if scanned % self._LOAD_LOG_EVERY == 0:
+                self.logger.info(
+                    "Scanned %d filings (%d with exhibits so far)", scanned, len(filings)
                 )
-                continue
 
-            filing = Filing(
-                cik=scraped_filing.cik,
-                filing_date=scraped_filing.filing_date,
-                report_date=self._report_date(scraped_filing),
-                form_type=scraped_filing.form_type,
-                accession_number=scraped_filing.accession_number,
-                primary_document=scraped_filing.index_url,
-                company_name=scraped_filing.company_name,
-                company=company_meta,
-            )
-            filing.exhibit_documents = self._select_exhibit_documents(
-                scraped_filing, filing.exhibit_type
-            )
-
-            if self._should_skip(filing, processed_accessions):
-                self.stats.increment("skipped_filings")
-                continue
-
-            if not filing.exhibit_documents:
-                self._record_failure(
-                    (filing.cik, filing.accession_number),
-                    FailureType.NO_EXHIBIT_FOUND,
-                    "warning",
-                    "No exhibit found for filing: %s - %s - %s (%s)",
-                    filing.cik,
-                    filing.accession_number,
-                    filing.filing_date,
-                    scraped_filing.index_url,
-                    stat_keys=("failed_filings",),
-                )
-                continue
-
-            if not filing.report_date:
-                # Neither the scraped manifest nor the submissions JSON dates this
-                # filing, so a row for it could only carry a null reporting period.
-                # Recorded as do-not-retry: re-reading the same two sources cannot
-                # produce a different answer.
-                self._record_failure(
-                    (filing.cik, filing.accession_number),
-                    FailureType.MISSING_REPORT_DATE,
-                    "warning",
-                    "No report date for filing: %s - %s - %s (%s)",
-                    filing.cik,
-                    filing.accession_number,
-                    filing.filing_date,
-                    scraped_filing.index_url,
-                    stat_keys=("failed_filings",),
-                )
-                continue
-
-            filings.append(filing)
+        self._total_filings = len(filings)
+        self.logger.info(
+            "Scan complete: %d filings scanned, %d with exhibits, %d exhibit documents",
+            self.stats.total_filing,
+            self._total_filings,
+            sum(len(f.exhibit_documents) for f in filings),
+        )
 
         return filings
+
+    def _build_filing(
+        self, scraped_filing: ScrapedFiling, processed_accessions: set[str]
+    ) -> Filing | None:
+        """Build a processable :class:`Filing`, or return None to exclude it.
+
+        Single exit point per scanned filing, so :meth:`load_input` can log scan
+        progress once per iteration regardless of which exclusion fired. Every
+        exclusion either records a failure or increments a stat, exactly as the
+        inline checks it replaces did.
+
+        The resume check runs first, before any SEC request: an accession already
+        in the output file or the failure registry needs neither company metadata
+        nor a report date, so skipping early avoids a submissions-JSON round trip
+        per already-processed filing.
+
+        Args:
+            scraped_filing: Manifest of the filing being considered.
+            processed_accessions: Accession numbers already present in the output
+                file.
+
+        Returns:
+            The built Filing, or None if it was skipped, failed metadata fetch,
+            has no matching exhibit documents, or has no resolvable report date.
+        """
+        if self._should_skip(scraped_filing, processed_accessions):
+            self.stats.increment("skipped_filings")
+            return None
+
+        try:
+            company_meta = self._fetch_company_meta(scraped_filing.cik)
+        except CompanyMetaFetchError:
+            # Retryable failure: not persisted to the registry, so the filing is
+            # neither written to output nor skipped on the next run.
+            self._record_failure(
+                (scraped_filing.cik, scraped_filing.accession_number),
+                FailureType.API_ERROR,
+                "warning",
+                "Failed to fetch company metadata for CIK %s - %s - will retry next run",
+                scraped_filing.cik,
+                scraped_filing.accession_number,
+                stat_keys=("failed_filings",),
+            )
+            return None
+
+        filing = Filing(
+            cik=scraped_filing.cik,
+            filing_date=scraped_filing.filing_date,
+            report_date=self._report_date(scraped_filing),
+            form_type=scraped_filing.form_type,
+            accession_number=scraped_filing.accession_number,
+            primary_document=scraped_filing.index_url,
+            company_name=scraped_filing.company_name,
+            company=company_meta,
+        )
+        filing.exhibit_documents = self._select_exhibit_documents(
+            scraped_filing, filing.exhibit_type
+        )
+
+        if not filing.exhibit_documents:
+            self._record_failure(
+                (filing.cik, filing.accession_number),
+                FailureType.NO_EXHIBIT_FOUND,
+                "debug",
+                "No exhibit found for filing: %s - %s - %s (%s)",
+                filing.cik,
+                filing.accession_number,
+                filing.filing_date,
+                scraped_filing.index_url,
+                stat_keys=("failed_filings",),
+            )
+            return None
+
+        if not filing.report_date:
+            # Neither the scraped manifest nor the submissions JSON dates this
+            # filing, so a row for it could only carry a null reporting period.
+            # Recorded as do-not-retry: re-reading the same two sources cannot
+            # produce a different answer.
+            self._record_failure(
+                (filing.cik, filing.accession_number),
+                FailureType.MISSING_REPORT_DATE,
+                "warning",
+                "No report date for filing: %s - %s - %s (%s)",
+                filing.cik,
+                filing.accession_number,
+                filing.filing_date,
+                scraped_filing.index_url,
+                stat_keys=("failed_filings",),
+            )
+            return None
+
+        return filing
 
     def _record_failure(
         self,
@@ -501,101 +635,104 @@ class SubsidiaryPipeline(Pipeline):
                 stat_keys=("zero_subsidiaries",),
             )
 
-    def _extract_worker(self, work_queue: queue.Queue, subsidiaries: list[Subsidiary]) -> None:
-        """Worker thread that extracts subsidiaries from queued exhibit documents.
+    def _extract_worker(self, work_queue: queue.Queue, results_queue: queue.Queue) -> None:
+        """Producer thread that extracts subsidiaries for one filing at a time.
 
-        Runs as a daemon thread, consuming ``(filing, exhibit_contents)`` tuples from
-        ``work_queue`` and posting extracted ``list[Subsidiary]`` results to
-        ``results_queue``. Extraction errors are caught, logged, and recorded in the
-        failure registry so the worker loop continues.
+        Consumes ``(filing, documents)`` items from ``work_queue`` — ``documents`` is
+        the filing's list of exhibit-content dicts — extracts each document,
+        accumulates the filing's subsidiaries, and posts a SINGLE accession-complete
+        batch to ``results_queue``. Posting a whole filing's results together means a
+        checkpoint can never persist a partial accession, so the accession-level
+        resume check (:meth:`_should_skip`) stays correct even if the run is
+        interrupted mid-flush. Per-document extraction errors are caught, logged, and
+        recorded so the filing's remaining documents (and later filings) still process.
 
         Args:
-            work_queue: Queue of ``(Filing, dict)`` tuples to process. Each dict has
-                ``"url"`` and ``"data"`` keys for the exhibit content.
-            subsidiaries: Shared list, guarded by ``self._results_lock``, that
-                extracted ``Subsidiary`` results are appended to.
+            work_queue: Queue of ``(Filing, list[dict])`` items. Each dict has ``"url"``
+                and ``"data"`` keys for one exhibit document's content.
+            results_queue: Queue the filing's combined ``list[Subsidiary]`` batch is
+                posted to for the results worker to consume.
 
         Returns:
             None
         """
         while True:
-            filing, exhibit_contents = work_queue.get()
+            filing, documents = work_queue.get()
+            batch: list[Subsidiary] = []
             try:
-                subsidiaries_batch, ungrounded_name, ungrounded_location, num_chunks = (
-                    self.extractor.extract(filing, exhibit_contents)
-                )
-                self._report_extraction(
-                    num_chunks=num_chunks,
-                    ungrounded_name=ungrounded_name,
-                    ungrounded_location=ungrounded_location,
-                    num_subsidiaries=len(subsidiaries_batch),
-                    filing=filing,
-                )
-                with self._results_lock:
-                    subsidiaries.extend(subsidiaries_batch)
+                for document in documents:
+                    try:
+                        subsidiaries_batch, ungrounded_name, ungrounded_location, num_chunks = (
+                            self.extractor.extract(filing, document)
+                        )
+                        self._report_extraction(
+                            num_chunks=num_chunks,
+                            ungrounded_name=ungrounded_name,
+                            ungrounded_location=ungrounded_location,
+                            num_subsidiaries=len(subsidiaries_batch),
+                            filing=filing,
+                        )
+                        batch.extend(subsidiaries_batch)
 
-            except DocumentError as e:
-                self._record_failure(
-                    (filing.cik, filing.accession_number),
-                    FailureType.DOCUMENT_ERROR,
-                    "error",
-                    "Document error for filing: %s - %s - %s: %s @ %s",
-                    filing.cik,
-                    filing.accession_number,
-                    filing.filing_date,
-                    e,
-                    exhibit_contents["url"],
-                )
+                    except DocumentError as e:
+                        self._record_failure(
+                            (filing.cik, filing.accession_number),
+                            FailureType.DOCUMENT_ERROR,
+                            "error",
+                            "Document error for filing: %s - %s - %s: %s @ %s",
+                            filing.cik,
+                            filing.accession_number,
+                            filing.filing_date,
+                            e,
+                            document["url"],
+                        )
 
-            except ExtractionTimeoutError:
-                self._record_failure(
-                    (filing.cik, filing.accession_number),
-                    FailureType.TIMEOUT_ERROR,
-                    "error",
-                    "Timeout extracting subsidiaries from filing: %s - %s - %s @ %s",
-                    filing.cik,
-                    filing.accession_number,
-                    filing.filing_date,
-                    exhibit_contents["url"],
-                    stat_keys=("failed_subsidiaries", "timeout_subsidiaries"),
-                )
+                    except ExtractionTimeoutError:
+                        self._record_failure(
+                            (filing.cik, filing.accession_number),
+                            FailureType.TIMEOUT_ERROR,
+                            "error",
+                            "Timeout extracting subsidiaries from filing: %s - %s - %s @ %s",
+                            filing.cik,
+                            filing.accession_number,
+                            filing.filing_date,
+                            document["url"],
+                            stat_keys=("failed_subsidiaries", "timeout_subsidiaries"),
+                        )
 
-            except ExtractionTruncatedError as e:
-                self._record_failure(
-                    (filing.cik, filing.accession_number),
-                    FailureType.TRUNCATED_ERROR,
-                    "error",
-                    "Truncated extraction for filing: %s - %s - %s: %s @ %s",
-                    filing.cik,
-                    filing.accession_number,
-                    filing.filing_date,
-                    e,
-                    exhibit_contents["url"],
-                    stat_keys=("failed_subsidiaries", "truncated_extractions"),
-                )
+                    except ExtractionTruncatedError as e:
+                        self._record_failure(
+                            (filing.cik, filing.accession_number),
+                            FailureType.TRUNCATED_ERROR,
+                            "error",
+                            "Truncated extraction for filing: %s - %s - %s: %s @ %s",
+                            filing.cik,
+                            filing.accession_number,
+                            filing.filing_date,
+                            e,
+                            document["url"],
+                            stat_keys=("failed_subsidiaries", "truncated_extractions"),
+                        )
 
-            except Exception as e:
-                self._record_failure(
-                    (filing.cik, filing.accession_number),
-                    FailureType.EXTRACTION_FAILED,
-                    "exception",
-                    "Error extracting subsidiaries from filing: %s - %s - %s @ %s: %s",
-                    filing.cik,
-                    filing.accession_number,
-                    filing.filing_date,
-                    exhibit_contents["url"],
-                    e,
-                )
+                    # Catch-all so one bad document can't kill the worker; recorded as a failure.
+                    except Exception as e:  # noqa: BLE001
+                        self._record_failure(
+                            (filing.cik, filing.accession_number),
+                            FailureType.EXTRACTION_FAILED,
+                            "exception",
+                            "Error extracting subsidiaries from filing: %s - %s - %s @ %s: %s",
+                            filing.cik,
+                            filing.accession_number,
+                            filing.filing_date,
+                            document["url"],
+                            e,
+                        )
 
             finally:
+                # Post the filing's combined (accession-complete) batch before marking
+                # the task done, so work_queue.join() implies every batch is enqueued.
+                results_queue.put(batch)
                 work_queue.task_done()
-                self.stats.increment("extracted_documents")
-                if self.stats.extracted_documents % self._LOG_EVERY == 0:
-                    self.logger.info(
-                        "Extracted %d / %d documents",
-                        self.stats.extracted_documents,
-                        self.stats.queued_documents,
-                    )
 
     def _extract_pdf_text(self, raw_content: bytes, doc_url: str, filing: Filing) -> str:
         """Extract plain text from a PDF exhibit using pdfplumber.
@@ -612,7 +749,7 @@ class SubsidiaryPipeline(Pipeline):
         try:
             with pdfplumber.open(io.BytesIO(raw_content)) as pdf:
                 text = "\n\n".join(page.extract_text() or "" for page in pdf.pages)
-        except Exception:
+        except Exception:  # noqa: BLE001
             self._record_failure(
                 (filing.cik, filing.accession_number),
                 FailureType.NO_EXHIBIT_CONTENT,
@@ -634,11 +771,25 @@ class SubsidiaryPipeline(Pipeline):
         exhibit_content = []
         for doc in filing.exhibit_documents:
             if not doc.s3_key:
+                # The scraper listed the document but never stored it, so there is
+                # nothing to fetch. Recorded rather than skipped silently: without a
+                # registry entry this filing would write no rows, land in neither the
+                # output nor the failure file, and be rescanned and refetched on every
+                # subsequent run. NO_EXHIBIT_CONTENT is do-not-retry, so it settles.
+                self._record_failure(
+                    (filing.cik, filing.accession_number),
+                    FailureType.NO_EXHIBIT_CONTENT,
+                    "warning",
+                    "Exhibit %s - %s - %s has no stored content to fetch.",
+                    doc.filename,
+                    filing.cik,
+                    filing.accession_number,
+                )
                 continue
 
             try:
                 raw_exhibit = load_content(doc.s3_key)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 self._record_failure(
                     (filing.cik, filing.accession_number),
                     FailureType.NO_EXHIBIT_CONTENT,
@@ -697,31 +848,71 @@ class SubsidiaryPipeline(Pipeline):
 
         return exhibit_content
 
+    def _results_worker(self, results_queue: queue.Queue, sink: "_ResultSink") -> None:
+        """Single consumer that feeds result batches into ``sink`` and checkpoints it.
+
+        Because only this thread drives ``sink``, the progress-log and checkpoint
+        cadences run off one race-free counter with no locking. Consumes batches until
+        it receives :attr:`_RESULTS_SENTINEL`, then returns; the final complete write is
+        left to :meth:`save_output` in :meth:`run` (over ``sink.drain()``), so this
+        worker only writes periodic checkpoints that make an interrupted run resumable
+        (via :meth:`_load_processed_accessions` / :meth:`_should_skip`) without
+        re-extracting — and re-paying for — completed documents.
+
+        Args:
+            results_queue: Queue of ``list[Subsidiary]`` batches (one per processed
+                document), terminated by :attr:`_RESULTS_SENTINEL`.
+            sink: Results sink this worker feeds; it owns the buffer and its flushes.
+
+        Returns:
+            None
+        """
+        while True:
+            batch = results_queue.get()
+            try:
+                if batch is self._RESULTS_SENTINEL:
+                    return
+                sink.add(batch)
+                extracted = self.stats.increment("extracted_filings")
+                if extracted % self._LOG_EVERY == 0:
+                    self.logger.info(
+                        "Progress: %d extracted, %d queued, %d total filings",
+                        extracted,
+                        self.stats.queued_filings,
+                        self._total_filings,
+                    )
+                if self.config.checkpoint_every and extracted % self.config.checkpoint_every == 0:
+                    sink.checkpoint(extracted)
+            finally:
+                results_queue.task_done()
+
     def process(self, input_list: list[Filing]) -> list[Subsidiary]:
         """Fetch exhibit content and extract subsidiaries from each filing.
 
-        Exhibit fetching runs on the main thread; extraction is parallelised
-        across :attr:`~PipelineConfig.num_workers` daemon threads. Progress is
-        logged periodically (every :attr:`_LOG_EVERY` documents) rather than
-        via a live progress bar, since bars don't render correctly in
-        aggregated cloud logs.
+        Exhibit fetching runs on the main thread; extraction is parallelised across
+        :attr:`~PipelineConfig.num_workers` daemon producer threads that post result
+        batches to a queue drained by a single results worker. That consumer owns the
+        results buffer and all output writes, so accumulation, progress logging (every
+        :attr:`_LOG_EVERY` documents), and periodic checkpoints need no locking.
+        Progress is logged periodically rather than via a live progress bar, since
+        bars don't render correctly in aggregated cloud logs.
 
         Args:
             input_list: List of :class:`Filing` objects returned by
                 :meth:`load_input`.
 
         Returns:
-            Deduplicated list of :class:`Subsidiary` objects extracted across all
-            filings.
+            List of :class:`Subsidiary` objects extracted across all filings.
         """
         work_queue = queue.Queue(maxsize=self.config.num_workers * 2)
-        subsidiaries = []
+        results_queue: queue.Queue = queue.Queue()
+        sink = _ResultSink(flush=self.save_output, logger=self.logger, total=self._total_filings)
 
-        # Start extract and results workers
+        # Producers extract in parallel; a single consumer owns the results buffer.
         extract_workers = [
             threading.Thread(
                 target=self._extract_worker,
-                args=(work_queue, subsidiaries),
+                args=(work_queue, results_queue),
                 daemon=True,
                 name=f"extract-worker-{i}",
             )
@@ -730,17 +921,29 @@ class SubsidiaryPipeline(Pipeline):
         for worker in extract_workers:
             worker.start()
 
-        # SEC operations to fetch exhibit data — one task per document
+        results_worker = threading.Thread(
+            target=self._results_worker,
+            args=(results_queue, sink),
+            daemon=True,
+            name="results-worker",
+        )
+        results_worker.start()
+
+        # SEC fetch on the main thread — one task per filing (all its exhibit
+        # documents together) so a filing's results are extracted and flushed as a unit.
         for filing in input_list:
             exhibit_contents = self._fetch_exhibit(filing)
-            for exhibit_content in exhibit_contents:
-                work_queue.put((filing, exhibit_content))
-                self.stats.increment("queued_documents")
+            work_queue.put((filing, exhibit_contents))
+            self.stats.increment("queued_filings")
 
-        # Wait for all extraction to complete
+        # Every producer posts its batch before task_done, so once work_queue drains
+        # all batches are on results_queue. Signal end-of-stream and let the consumer
+        # finish; run() performs the final, complete save_output over the drained tail.
         work_queue.join()
+        results_queue.put(self._RESULTS_SENTINEL)
+        results_worker.join()
 
-        return subsidiaries
+        return sink.drain()
 
     def save_output(self, processed_list: list[Subsidiary]) -> None:
         """Deduplicate and persist extracted subsidiaries as a Parquet file.
@@ -761,7 +964,10 @@ class SubsidiaryPipeline(Pipeline):
             # output file exists yet, the location/parent_state_of_incorporation
             # normalization below would KeyError on a columnless frame. There's
             # nothing new to merge or normalize either way, so skip entirely.
-            self.logger.info("No new subsidiaries extracted; skipping save_output")
+            self.logger.info(
+                "No subsidiaries to write; skipping save_output "
+                "(all results already checkpointed, or none extracted)"
+            )
             return
 
         # Save processed subsidiaries to a DataFrame

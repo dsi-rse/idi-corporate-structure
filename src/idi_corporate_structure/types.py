@@ -102,6 +102,7 @@ class PipelineConfig:
     sec_bucket: str
     openai_api_key: str = ""
     failure_flush_every: int = 50
+    checkpoint_every: int = 500
     rate_limit: float = 0.2
     num_workers: int = 10
 
@@ -133,22 +134,29 @@ class PipelineStats:
     html_exhibits: int = 0
     txt_exhibits: int = 0
     pdf_exhibits: int = 0
-    queued_documents: int = 0
-    extracted_documents: int = 0
+    queued_filings: int = 0
+    extracted_filings: int = 0
 
     def __post_init__(self) -> None:
         """Initialize the pipeline stats."""
         self._lock = threading.Lock()
 
-    def increment(self, field: str, n: int = 1) -> None:
+    def increment(self, field: str, n: int = 1) -> int:
         """Increment the pipeline stats by a given amount.
 
         Args:
             field: The field to increment
             n: The amount to increment the field by
+
+        Returns:
+            The field's new value. Returned under the same lock as the
+            increment so callers can test milestones (e.g. "every N
+            items") without a separate, racy read of the counter.
         """
         with self._lock:
-            setattr(self, field, getattr(self, field) + n)
+            new_value = getattr(self, field) + n
+            setattr(self, field, new_value)
+            return new_value
 
 
 @dataclass

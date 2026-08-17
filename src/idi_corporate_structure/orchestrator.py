@@ -122,6 +122,17 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--rate-limit", type=float, default=0.2, help="Rate limit")
     parser.add_argument("--num-workers", type=int, default=10, help="Number of workers")
     parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=500,
+        help="Flush extracted results to the output file every N documents (0 disables)",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable DEBUG-level logging (per-filing 'no exhibit' and grounding-drop detail)",
+    )
+    parser.add_argument(
         "--look-back",
         type=int,
         default=None,
@@ -166,8 +177,14 @@ def get_dates(args: argparse.Namespace) -> tuple[datetime.date, datetime.date]:
 
 def main() -> None:
     """Main function to run the pipeline orchestrator."""
-    start = datetime.datetime.now()
+    start = datetime.datetime.now(datetime.UTC)
     args = get_args()
+
+    # Set before any logger is created: get_logger reads LOG_LEVEL from the
+    # environment and applies it to every logger (orchestrator, pipeline,
+    # extractor), so --verbose flips them all to DEBUG in one place.
+    if args.verbose:
+        os.environ["LOG_LEVEL"] = "DEBUG"
 
     logger = get_logger("orchestrator")
     for key, value in vars(args).items():
@@ -188,6 +205,7 @@ def main() -> None:
         sec_bucket=args.sec_bucket_prefix.split("/")[0],
         rate_limit=args.rate_limit,
         num_workers=args.num_workers,
+        checkpoint_every=args.checkpoint_every,
         openai_api_key=args.openai_api_key,
     )
     sec_client = SecClient(rate_limit=config.rate_limit, user_agent=args.sec_user_agent)
@@ -195,8 +213,8 @@ def main() -> None:
     pipeline = SubsidiaryPipeline(config=config, sec_client=sec_client, extractor=extractor)
     pipeline.run()
 
-    end = datetime.datetime.now()
-    print(f"Elasped time: {end - start}")
+    end = datetime.datetime.now(datetime.UTC)
+    print(f"Elapsed time: {end - start}")
 
 
 if __name__ == "__main__":

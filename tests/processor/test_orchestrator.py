@@ -48,6 +48,21 @@ class TestGetArgs:
 
         assert args.sec_bucket_prefix == "test-bucket/sec"
 
+    def test_verbose_defaults_false_and_checkpoint_every_default(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", _FULL_ARGS)
+
+        args = get_args()
+
+        assert args.verbose is False
+        assert args.checkpoint_every == 500
+
+    def test_verbose_flag_enables_debug(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", [*_FULL_ARGS, "--verbose"])
+
+        args = get_args()
+
+        assert args.verbose is True
+
 
 class TestGetDates:
     """Tests for get_dates() date-range resolution."""

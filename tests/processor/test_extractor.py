@@ -289,6 +289,53 @@ class TestGptExtractor:
         assert len(result) == 1
         assert result[0].name == "Apple Operations LLC"
 
+    def test_drops_logged_as_one_warning_per_document(self, sample_filing, mocker):
+        """Per-subsidiary drops stay DEBUG; the document gets one WARNING summary."""
+        extractor = GptExtractor(openai_api_key="fake-key")
+        mocker.patch.object(
+            extractor._openai_client,
+            "query_endpoint",
+            return_value=_make_openai_response(
+                [
+                    {
+                        "name": "Apple Operations LLC",
+                        "location": "Delaware",
+                        "source_quote": _QUOTE_APPLE_OPS,
+                    },
+                    {"name": "Ghost Corp", "location": "Nevada", "source_quote": "Ghost"},
+                    {"name": "Phantom Inc", "location": "Nevada", "source_quote": "Phantom"},
+                ]
+            ),
+        )
+        warn_spy = mocker.spy(extractor._logger, "warning")
+
+        extractor.extract(sample_filing, make_exhibit_response())
+
+        warn_spy.assert_called_once()
+        assert "Dropped %d of %d ungrounded subsidiaries" in warn_spy.call_args.args[0]
+        assert warn_spy.call_args.args[1:3] == (2, 3)
+
+    def test_no_drop_warning_when_everything_grounds(self, sample_filing, mocker):
+        extractor = GptExtractor(openai_api_key="fake-key")
+        mocker.patch.object(
+            extractor._openai_client,
+            "query_endpoint",
+            return_value=_make_openai_response(
+                [
+                    {
+                        "name": "Apple Operations LLC",
+                        "location": "Delaware",
+                        "source_quote": _QUOTE_APPLE_OPS,
+                    }
+                ]
+            ),
+        )
+        warn_spy = mocker.spy(extractor._logger, "warning")
+
+        extractor.extract(sample_filing, make_exhibit_response())
+
+        warn_spy.assert_not_called()
+
     def test_empty_source_quote_kept_when_name_in_doc(self, sample_filing, mocker):
         """An empty source_quote is not a drop reason when the name is grounded."""
         extractor = GptExtractor(openai_api_key="fake-key")
@@ -689,9 +736,10 @@ class TestExtractWithChunking:
 class TestPerChunkYieldLogging:
     """Per-chunk ``input rows → extracted`` logging in _summarize_chunks.
 
-    The yield ratio is our cheapest signal for catching laziness regressions:
-    if a chunk has 116 rows and the model returns 70, that's a 0.60 yield and
-    deserves a WARNING in the run log.
+    The yield ratio is our cheapest signal for catching laziness regressions,
+    but per-chunk detail is high-volume, so it is logged at DEBUG (recoverable
+    with --verbose) rather than polluting the default run log. Low yield is still
+    surfaced through the sibling-outlier re-extraction path and aggregate stats.
     """
 
     def _build_chunked_doc(self, paragraphs: int = 300) -> dict:
@@ -702,10 +750,10 @@ class TestPerChunkYieldLogging:
             )
         )
 
-    def test_yield_log_emitted_per_chunk(self, sample_filing, mocker):
-        """One yield log line per chunk, at INFO level when yield is healthy."""
+    def test_yield_log_emitted_per_chunk_at_debug(self, sample_filing, mocker):
+        """One yield log line per chunk, at DEBUG level."""
         extractor = GptExtractor(openai_api_key="fake-key")
-        info_spy = mocker.spy(extractor._logger, "info")
+        debug_spy = mocker.spy(extractor._logger, "debug")
         mocker.patch.object(
             extractor,
             "_summarize",
@@ -723,13 +771,14 @@ class TestPerChunkYieldLogging:
 
         _, _, _, num_chunks = extractor.extract(sample_filing, self._build_chunked_doc())
 
-        yield_calls = [c for c in info_spy.call_args_list if "input rows" in c.args[0]]
+        yield_calls = [c for c in debug_spy.call_args_list if "input rows" in c.args[0]]
         assert len(yield_calls) == num_chunks
         assert all("yield=" in c.args[0] for c in yield_calls)
 
-    def test_low_yield_emits_warning(self, sample_filing, mocker):
-        """Chunk yield below _LOW_YIELD_RATIO is logged as a WARNING."""
+    def test_low_yield_logged_at_debug_not_warning(self, sample_filing, mocker):
+        """A low-yield chunk logs at DEBUG, not WARNING — it stays out of the default log."""
         extractor = GptExtractor(openai_api_key="fake-key")
+        debug_spy = mocker.spy(extractor._logger, "debug")
         warning_spy = mocker.spy(extractor._logger, "warning")
         mocker.patch.object(
             extractor,
@@ -747,33 +796,8 @@ class TestPerChunkYieldLogging:
 
         extractor.extract(sample_filing, self._build_chunked_doc())
 
-        yield_warnings = [c for c in warning_spy.call_args_list if "input rows" in c.args[0]]
-        assert yield_warnings, "low-yield chunk should produce a WARNING-level yield log"
-
-    def test_healthy_yield_does_not_warn(self, sample_filing, mocker):
-        """High-yield chunks do not emit WARNING-level yield logs."""
-        extractor = GptExtractor(openai_api_key="fake-key")
-        warning_spy = mocker.spy(extractor._logger, "warning")
-
-        def echo(doc):
-            rows = [p for p in doc.split("\n\n") if p.strip()]
-            return {
-                "subsidiaries": [
-                    {
-                        "name": p.split(" (")[0],
-                        "location": "Delaware",
-                        "source_quote": p,
-                    }
-                    for p in rows
-                ]
-            }
-
-        mocker.patch.object(extractor, "_summarize", side_effect=echo)
-
-        extractor.extract(sample_filing, self._build_chunked_doc())
-
-        yield_warnings = [c for c in warning_spy.call_args_list if "input rows" in c.args[0]]
-        assert not yield_warnings, "healthy-yield chunks should not warn"
+        assert [c for c in debug_spy.call_args_list if "input rows" in c.args[0]]
+        assert not [c for c in warning_spy.call_args_list if "input rows" in c.args[0]]
 
 
 class TestRetryOutlierChunks:
@@ -898,6 +922,56 @@ class TestRetryOutlierChunks:
 
         assert extractor._reextract_outlier(self._chunk("Row", 60)) == []
 
+    def test_returns_retried_chunk_count(self, mocker):
+        """The count is what lets the caller summarize per document, not per chunk."""
+        extractor = GptExtractor(openai_api_key="fake-key")
+        chunks = [self._chunk("A", 10), self._chunk("B", 10), self._chunk("C", 10)]
+        subs = [
+            [self._sub(f"A{i} LLC") for i in range(9)],
+            [self._sub(f"B{i} LLC") for i in range(3)],  # outlier
+            [self._sub(f"C{i} LLC") for i in range(9)],
+        ]
+        mocker.patch.object(extractor, "_reextract_outlier", return_value=[])
+
+        assert extractor._retry_outlier_chunks(chunks, subs, "ACME", "url") == 1
+
+    def test_returns_zero_when_nothing_retried(self, mocker):
+        extractor = GptExtractor(openai_api_key="fake-key")
+        chunks = [self._chunk("A", 10), self._chunk("B", 10), self._chunk("C", 10)]
+        subs = [[self._sub(f"{p}{i} LLC") for i in range(9)] for p in "ABC"]
+        mocker.patch.object(extractor, "_reextract_outlier")
+
+        assert extractor._retry_outlier_chunks(chunks, subs, "ACME", "url") == 0
+
+    def test_summary_warning_logged_once_per_document(self, mocker):
+        """Per-chunk detail stays DEBUG; the document gets one WARNING with the count."""
+        extractor = GptExtractor(openai_api_key="fake-key")
+        chunks = [self._chunk("A", 10), self._chunk("B", 10), self._chunk("C", 10)]
+        mocker.patch("idi_corporate_structure.extractor._chunk_document", return_value=chunks)
+        mocker.patch.object(extractor, "_retry_outlier_chunks", return_value=2)
+        mocker.patch.object(
+            extractor, "_summarize", return_value={"subsidiaries": [self._sub("A0 LLC")]}
+        )
+        warn_spy = mocker.spy(extractor._logger, "warning")
+
+        extractor._summarize_chunks(self._chunk("A", 30), "ACME", "url")
+
+        warn_spy.assert_called_once()
+        assert "chunks re-extracted as low-yield outliers" in warn_spy.call_args.args[0]
+        assert warn_spy.call_args.args[2:4] == (2, 3)  # 2 of 3 chunks retried
+
+    def test_no_summary_warning_when_no_outliers(self, mocker):
+        extractor = GptExtractor(openai_api_key="fake-key")
+        mocker.patch.object(extractor, "_retry_outlier_chunks", return_value=0)
+        mocker.patch.object(
+            extractor, "_summarize", return_value={"subsidiaries": [self._sub("A0 LLC")]}
+        )
+        warn_spy = mocker.spy(extractor._logger, "warning")
+
+        extractor._summarize_chunks(self._chunk("A", 30), "ACME", "url")
+
+        warn_spy.assert_not_called()
+
 
 class TestWindowedSubsequenceGrounding:
     """Windowed in-order token fallback + control/zero-width stripping in grounding."""
@@ -907,7 +981,7 @@ class TestWindowedSubsequenceGrounding:
         from idi_corporate_structure.extractor import _is_name_in_document
 
         # Name cell wrapped across rows, interleaved with the row's other columns.
-        doc = "PT Telekomunikasi ​ Mobile ​ 1995 ​ 70 ​ 70 selular ​ telecommunication"
+        doc = "PT Telekomunikasi \u200b Mobile \u200b 1995 \u200b 70 \u200b 70 selular \u200b telecommunication"
         assert _is_name_in_document("PT Telekomunikasi Selular", doc)
 
     def test_rejects_tokens_scattered_beyond_window(self):
@@ -936,7 +1010,7 @@ class TestWindowedSubsequenceGrounding:
         from idi_corporate_structure import extractor as ext_mod
 
         mock_logger = mocker.patch.object(ext_mod, "get_logger")
-        doc = "PT Telekomunikasi ​ Mobile ​ 1995 selular ​ telecommunication"
+        doc = "PT Telekomunikasi \u200b Mobile \u200b 1995 selular \u200b telecommunication"
 
         ext_mod._is_name_in_document("PT Telekomunikasi Selular", doc)
 
@@ -946,7 +1020,7 @@ class TestWindowedSubsequenceGrounding:
     def test_zero_width_space_stripped_in_grounding(self):
         from idi_corporate_structure.extractor import _is_name_in_document
 
-        assert _is_name_in_document("FooBar Holdings LLC", "Foo​Bar Holdings LLC (Delaware)")
+        assert _is_name_in_document("FooBar Holdings LLC", "Foo\u200bBar Holdings LLC (Delaware)")
 
     def test_control_char_stripped_in_grounding(self):
         """A C0 control char embedded in both name and doc is normalized away consistently."""
@@ -967,7 +1041,7 @@ class TestIsNameGrounded:
             _normalize,
         )
 
-        doc = "Apple Operations LLC (Delaware) — PT Telekomunikasi ​ Mobile selular"
+        doc = "Apple Operations LLC (Delaware) — PT Telekomunikasi \u200b Mobile selular"
         doc_norm, doc_compact = _normalize(doc), _compact(doc)
 
         assert _is_name_grounded("Apple Operations LLC", doc_norm, doc_compact)  # strict
