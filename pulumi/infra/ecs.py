@@ -56,7 +56,7 @@ sec_bucket_prefix = f"{config.bucket_name}/{sec_prefix}"
 # existing object makes every filing look unprocessed on the next run.
 database_prefix = config.config.get("database_prefix") or "database"
 output_file = f"s3://{config.bucket_name}/{database_prefix}/{config.app_name}/latest.parquet"
-failure_file = f"s3://{config.bucket_name}/{config.app_name}/failures/failures.json"
+failure_file = f"s3://{config.bucket_name}/processors/{config.app_name}/failures/failures.json"
 
 # Container definition as JSON (required by aws.ecs.TaskDefinition)
 container_definitions = pulumi.Output.all(
