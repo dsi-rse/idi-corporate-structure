@@ -295,6 +295,11 @@ class SubsidiaryPipeline(Pipeline):
         # scraper manifest. Populated only in CIK-override mode; surfaced by
         # the per-CIK coverage report.
         self._override_no_filing: list[str] = []
+        # Per-CIK coverage report, keyed by normalized CIK. Seeded (one entry
+        # per requested CIK) when the override scan runs; dispositions are
+        # updated as filings are skipped, fail, or complete. Only populated in
+        # CIK-override mode.
+        self._cik_report: dict[str, dict[str, str]] = {}
         self._company_meta_cache: dict[str, CompanyMeta] = {}
         # accession_number -> reportDate, per CIK. Populated from the same
         # submissions response as the company metadata, so recovering a missing
@@ -469,10 +474,26 @@ class SubsidiaryPipeline(Pipeline):
         # ISO date strings sort lexicographically, so tail(1) is the latest.
         latest = candidates.sort_values("filing_date").groupby("cik_norm", as_index=False).tail(1)
 
+        for row in latest.itertuples(index=False):
+            self._cik_report[row.cik_norm] = {
+                "cik": row.cik_norm,
+                "form_type": str(row.form_type),
+                "filing_date": str(row.filing_date),
+                "accession_number": str(row.accession_number),
+                "disposition": "pending",
+            }
+
         found_ciks = set(latest["cik_norm"])
         for cik in self.config.ciks:
             if cik not in found_ciks:
                 self._override_no_filing.append(cik)
+                self._cik_report[cik] = {
+                    "cik": cik,
+                    "form_type": "",
+                    "filing_date": "",
+                    "accession_number": "",
+                    "disposition": "NO_TARGET_FILING_IN_MANIFEST",
+                }
                 self.logger.warning(
                     "No target filing in manifest for CIK %s; nothing to process", cik
                 )
@@ -579,6 +600,17 @@ class SubsidiaryPipeline(Pipeline):
         """
         if self._should_skip(scraped_filing, processed_accessions):
             self.stats.increment("skipped_filings")
+            if scraped_filing.accession_number in processed_accessions:
+                self._set_cik_disposition(scraped_filing.cik, "already_in_output")
+            else:
+                # FailureRegistry keeps the recorded failure type in _reasons but
+                # exposes no getter; read it defensively for the report.
+                reason = getattr(self.failure_registry, "_reasons", {}).get(
+                    (scraped_filing.cik, scraped_filing.accession_number), ""
+                )
+                self._set_cik_disposition(
+                    scraped_filing.cik, f"skipped_failure({reason or 'unknown'})"
+                )
             return None
 
         try:
@@ -671,6 +703,59 @@ class SubsidiaryPipeline(Pipeline):
         for key_ in stat_keys:
             self.stats.increment(key_)
         self.failure_registry.add(key, failure_type)
+        self._set_cik_disposition(key[0], f"failed({failure_type})")
+
+    def _set_cik_disposition(
+        self, cik: str, disposition: str, *, only_if_pending: bool = False
+    ) -> None:
+        """Update a CIK's entry in the coverage report, if one exists.
+
+        No-op outside CIK-override mode (the report is never seeded) and for
+        CIKs that were not requested. Each requested CIK maps to exactly one
+        filing, worked by one extraction thread, so entry updates are not
+        contended.
+
+        Args:
+            cik: CIK in any zero-padding form.
+            disposition: New disposition string.
+            only_if_pending: Only apply if no disposition has been set yet —
+                used for the terminal "processed" mark so it never overwrites
+                a failure recorded while extracting the same filing.
+        """
+        entry = self._cik_report.get(self._normalize_cik(cik))
+        if entry is None:
+            return
+        if only_if_pending and entry["disposition"] != "pending":
+            return
+        entry["disposition"] = disposition
+
+    def _log_cik_report(self) -> None:
+        """Log the per-CIK coverage table.
+
+        Covers every requested CIK exactly once, in request order. Log-only by
+        design: the run's sole S3 side effects stay the output parquet and the
+        failure registry. Skipped when the report was never seeded (the run
+        failed before the override scan).
+        """
+        if not self._cik_report:
+            return
+
+        self.logger.info("=" * 40)
+        self.logger.info("CIK coverage report")
+        self.logger.info("=" * 40)
+        for cik in self.config.ciks:
+            entry = self._cik_report.get(cik)
+            if entry is None:
+                continue
+            self.logger.info(
+                "  CIK %s: %s [%s %s %s]",
+                entry["cik"],
+                entry["disposition"],
+                entry["form_type"] or "-",
+                entry["filing_date"] or "-",
+                entry["accession_number"] or "-",
+            )
+        self.logger.info("=" * 40)
 
     def _report_extraction(
         self,
@@ -806,6 +891,9 @@ class SubsidiaryPipeline(Pipeline):
                         )
 
             finally:
+                # Terminal mark for the coverage report; a failure recorded for
+                # this filing above takes precedence over "processed".
+                self._set_cik_disposition(filing.cik, "processed", only_if_pending=True)
                 # Post the filing's combined (accession-complete) batch before marking
                 # the task done, so work_queue.join() implies every batch is enqueued.
                 results_queue.put(batch)
@@ -1141,8 +1229,14 @@ class SubsidiaryPipeline(Pipeline):
         self.logger.info("=" * 40)
 
     def run(self) -> None:
-        """Run the pipeline, flushing any buffered failures on completion."""
+        """Run the pipeline, flushing any buffered failures on completion.
+
+        In CIK-override mode, also logs the per-CIK coverage report — even
+        when every filing was skipped and no extraction ran.
+        """
         try:
             super().run()
         finally:
             self.failure_registry.flush()
+            if self.config.ciks:
+                self._log_cik_report()

@@ -1657,63 +1657,66 @@ def make_override_manifest() -> pd.DataFrame:
     )
 
 
+@pytest.fixture
+def override_pipeline(pipeline):
+    """The shared pipeline fixture, switched into CIK-override mode."""
+    pipeline.config.ciks = ("320193", "1913847")
+    pipeline.config.start_date = None
+    pipeline.config.end_date = None
+    return pipeline
+
+
+@pytest.fixture
+def patch_manifest(mocker):
+    """Serve the synthetic manifest for the s3 manifest read only."""
+
+    def fake_read_parquet(path, columns=None, **kwargs):
+        if "manifest.parquet" in str(path):
+            return make_override_manifest()
+        raise FileNotFoundError(path)  # no output file yet
+
+    return mocker.patch(
+        "idi_corporate_structure.pipeline.pd.read_parquet", side_effect=fake_read_parquet
+    )
+
+
+@pytest.fixture
+def patch_iter(mocker):
+    """iter_filings_by_form_type stub keyed by requested date, recording calls."""
+    calls = []
+    by_date = {
+        datetime.date(2024, 2, 1): [
+            make_scraped_filing(
+                cik="0000320193", accession_number="ACC-NEW", filing_date="2024-02-01"
+            ),
+            # Same day, un-requested CIK: must be filtered out.
+            make_scraped_filing(
+                cik="0000999999", accession_number="ACC-OTHER", filing_date="2024-02-01"
+            ),
+        ],
+        datetime.date(2024, 3, 15): [
+            make_scraped_filing(
+                cik="1913847",
+                accession_number="ACC-20F",
+                form_type="20-F",
+                filing_date="2024-03-15",
+                documents=[make_scraped_document(filename="ex8.htm", doc_type="EX-8.1")],
+            ),
+        ],
+    }
+
+    def fake_iter(form_types, start_date, end_date, *, bucket, search_by):
+        calls.append({"start_date": start_date, "end_date": end_date, "search_by": search_by})
+        return list(by_date.get(start_date, []))
+
+    mocker.patch(
+        "idi_corporate_structure.pipeline.iter_filings_by_form_type", side_effect=fake_iter
+    )
+    return calls
+
+
 class TestCikOverrideLoadInput:
     """Tests for load_input in CIK-override mode (_iter_override_filings)."""
-
-    @pytest.fixture
-    def override_pipeline(self, pipeline):
-        """The shared pipeline fixture, switched into CIK-override mode."""
-        pipeline.config.ciks = ("320193", "1913847")
-        pipeline.config.start_date = None
-        pipeline.config.end_date = None
-        return pipeline
-
-    @pytest.fixture
-    def patch_manifest(self, mocker):
-        """Serve the synthetic manifest for the s3 manifest read only."""
-
-        def fake_read_parquet(path, columns=None, **kwargs):
-            if "manifest.parquet" in str(path):
-                return make_override_manifest()
-            raise FileNotFoundError(path)  # no output file yet
-
-        return mocker.patch(
-            "idi_corporate_structure.pipeline.pd.read_parquet", side_effect=fake_read_parquet
-        )
-
-    @pytest.fixture
-    def patch_iter(self, mocker):
-        """iter_filings_by_form_type stub keyed by requested date, recording calls."""
-        calls = []
-        by_date = {
-            datetime.date(2024, 2, 1): [
-                make_scraped_filing(
-                    cik="0000320193", accession_number="ACC-NEW", filing_date="2024-02-01"
-                ),
-                # Same day, un-requested CIK: must be filtered out.
-                make_scraped_filing(
-                    cik="0000999999", accession_number="ACC-OTHER", filing_date="2024-02-01"
-                ),
-            ],
-            datetime.date(2024, 3, 15): [
-                make_scraped_filing(
-                    cik="1913847",
-                    accession_number="ACC-20F",
-                    form_type="20-F",
-                    filing_date="2024-03-15",
-                    documents=[make_scraped_document(filename="ex8.htm", doc_type="EX-8.1")],
-                ),
-            ],
-        }
-
-        def fake_iter(form_types, start_date, end_date, *, bucket, search_by):
-            calls.append({"start_date": start_date, "end_date": end_date, "search_by": search_by})
-            return list(by_date.get(start_date, []))
-
-        mocker.patch(
-            "idi_corporate_structure.pipeline.iter_filings_by_form_type", side_effect=fake_iter
-        )
-        return calls
 
     def test_selects_latest_target_filing_per_cik(
         self, override_pipeline, patch_manifest, patch_iter, mocker
@@ -1786,3 +1789,125 @@ class TestCikOverrideLoadInput:
         assert filings == []
         assert override_pipeline._override_no_filing == ["884100"]
         assert patch_iter == []  # no manifest hits, no per-date queries
+
+
+# ── CIK coverage report ──────────────────────────────────────────────────────
+
+
+class TestCikCoverageReport:
+    """Tests for the per-CIK coverage report in override mode."""
+
+    @pytest.fixture
+    def three_cik_pipeline(self, override_pipeline):
+        """Override pipeline requesting two manifest CIKs plus one absent CIK."""
+        override_pipeline.config.ciks = ("320193", "1913847", "884100")
+        return override_pipeline
+
+    def _dispositions(self, pipeline_):
+        return {cik: entry["disposition"] for cik, entry in pipeline_._cik_report.items()}
+
+    def test_load_input_seeds_skip_and_missing_dispositions(
+        self, three_cik_pipeline, patch_manifest, patch_iter, mocker
+    ):
+        """already_in_output vs skipped_failure(type) vs NO_TARGET_FILING_IN_MANIFEST."""
+        three_cik_pipeline.failure_registry.add(
+            ("0000320193", "ACC-NEW"), FailureType.NO_SUBSIDIARIES
+        )
+        mocker.patch.object(
+            three_cik_pipeline, "_load_processed_accessions", return_value={"ACC-20F"}
+        )
+
+        filings = three_cik_pipeline.load_input()
+
+        assert filings == []
+        assert self._dispositions(three_cik_pipeline) == {
+            "320193": "skipped_failure(no_subsidiaries)",
+            "1913847": "already_in_output",
+            "884100": "NO_TARGET_FILING_IN_MANIFEST",
+        }
+
+    def test_full_run_marks_processed_and_logs_report(
+        self, three_cik_pipeline, patch_manifest, patch_iter, mocker, tmp_path
+    ):
+        """Successful extraction ends as 'processed'; report logged, one line per CIK."""
+        mocker.patch.object(three_cik_pipeline, "_fetch_company_meta", return_value=CompanyMeta())
+        mocker.patch.object(
+            three_cik_pipeline,
+            "_fetch_exhibit",
+            return_value=[{"url": "https://example.com/ex21.htm", "data": "Sub LLC (Delaware)"}],
+        )
+        three_cik_pipeline.extractor.extract.return_value = ([make_subsidiary()], 0, 0, 1)
+        info_spy = mocker.spy(three_cik_pipeline.logger, "info")
+
+        three_cik_pipeline.run()
+
+        assert self._dispositions(three_cik_pipeline) == {
+            "320193": "processed",
+            "1913847": "processed",
+            "884100": "NO_TARGET_FILING_IN_MANIFEST",
+        }
+        # One report line per requested CIK, in request order.
+        cik_lines = [c.args for c in info_spy.call_args_list if c.args[0].startswith("  CIK %s:")]
+        assert [args[1] for args in cik_lines] == ["320193", "1913847", "884100"]
+        # Log-only: the report must not create files beside the output parquet.
+        assert not (tmp_path / "cik_coverage_report.csv").exists()
+
+    def test_extraction_failure_wins_over_processed_mark(
+        self, three_cik_pipeline, patch_manifest, patch_iter, mocker
+    ):
+        mocker.patch.object(three_cik_pipeline, "_fetch_company_meta", return_value=CompanyMeta())
+        mocker.patch.object(
+            three_cik_pipeline,
+            "_fetch_exhibit",
+            return_value=[{"url": "https://example.com/ex21.htm", "data": "text"}],
+        )
+        three_cik_pipeline.extractor.extract.side_effect = DocumentError("too long")
+
+        three_cik_pipeline.run()
+
+        dispositions = self._dispositions(three_cik_pipeline)
+        assert dispositions["320193"] == "failed(document_error)"
+        assert dispositions["1913847"] == "failed(document_error)"
+
+    def test_zero_subsidiaries_marks_failed(
+        self, three_cik_pipeline, patch_manifest, patch_iter, mocker
+    ):
+        mocker.patch.object(three_cik_pipeline, "_fetch_company_meta", return_value=CompanyMeta())
+        mocker.patch.object(
+            three_cik_pipeline,
+            "_fetch_exhibit",
+            return_value=[{"url": "https://example.com/ex21.htm", "data": "text"}],
+        )
+        three_cik_pipeline.extractor.extract.return_value = ([], 0, 0, 1)
+
+        three_cik_pipeline.run()
+
+        assert self._dispositions(three_cik_pipeline)["320193"] == "failed(no_subsidiaries)"
+
+    def test_all_skipped_run_still_logs_report(
+        self, three_cik_pipeline, patch_manifest, patch_iter, mocker
+    ):
+        """Report is emitted even when load_input returns nothing to process."""
+        mocker.patch.object(
+            three_cik_pipeline,
+            "_load_processed_accessions",
+            return_value={"ACC-NEW", "ACC-20F"},
+        )
+        info_spy = mocker.spy(three_cik_pipeline.logger, "info")
+
+        three_cik_pipeline.run()
+
+        cik_lines = [c.args for c in info_spy.call_args_list if c.args[0].startswith("  CIK %s:")]
+        assert len(cik_lines) == 3
+        assert {args[2] for args in cik_lines} == {
+            "already_in_output",
+            "NO_TARGET_FILING_IN_MANIFEST",
+        }
+
+    def test_no_report_outside_override_mode(self, pipeline, mocker):
+        mocker.patch("idi_corporate_structure.pipeline.iter_filings_by_form_type", return_value=[])
+        info_spy = mocker.spy(pipeline.logger, "info")
+
+        pipeline.run()
+
+        assert all("CIK coverage report" not in str(c.args[0]) for c in info_spy.call_args_list)
