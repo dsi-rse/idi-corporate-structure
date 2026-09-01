@@ -1,5 +1,6 @@
 """Tests for processor.pipeline — SubsidiaryPipeline."""
 
+import datetime
 import queue
 import threading
 from pathlib import Path
@@ -1638,3 +1639,150 @@ class TestRunEarlyExit:
         pipeline.run()
 
         mock_flush.assert_called_once()
+
+
+# ── CIK-override mode ────────────────────────────────────────────────────────
+
+
+def make_override_manifest() -> pd.DataFrame:
+    """Synthetic manifest.parquet frame: padded CIKs, one row per document."""
+    return pd.DataFrame(
+        {
+            "form_type": ["10-K", "10-K", "10-K", "8-K", "20-F"],
+            # Duplicate ACC-NEW row: manifests carry one row per scraped document.
+            "filing_date": ["2023-02-01", "2024-02-01", "2024-02-01", "2024-06-01", "2024-03-15"],
+            "cik": ["0000320193", "0000320193", "0000320193", "0000320193", "1913847"],
+            "accession_number": ["ACC-OLD", "ACC-NEW", "ACC-NEW", "ACC-8K", "ACC-20F"],
+        }
+    )
+
+
+class TestCikOverrideLoadInput:
+    """Tests for load_input in CIK-override mode (_iter_override_filings)."""
+
+    @pytest.fixture
+    def override_pipeline(self, pipeline):
+        """The shared pipeline fixture, switched into CIK-override mode."""
+        pipeline.config.ciks = ("320193", "1913847")
+        pipeline.config.start_date = None
+        pipeline.config.end_date = None
+        return pipeline
+
+    @pytest.fixture
+    def patch_manifest(self, mocker):
+        """Serve the synthetic manifest for the s3 manifest read only."""
+
+        def fake_read_parquet(path, columns=None, **kwargs):
+            if "manifest.parquet" in str(path):
+                return make_override_manifest()
+            raise FileNotFoundError(path)  # no output file yet
+
+        return mocker.patch(
+            "idi_corporate_structure.pipeline.pd.read_parquet", side_effect=fake_read_parquet
+        )
+
+    @pytest.fixture
+    def patch_iter(self, mocker):
+        """iter_filings_by_form_type stub keyed by requested date, recording calls."""
+        calls = []
+        by_date = {
+            datetime.date(2024, 2, 1): [
+                make_scraped_filing(
+                    cik="0000320193", accession_number="ACC-NEW", filing_date="2024-02-01"
+                ),
+                # Same day, un-requested CIK: must be filtered out.
+                make_scraped_filing(
+                    cik="0000999999", accession_number="ACC-OTHER", filing_date="2024-02-01"
+                ),
+            ],
+            datetime.date(2024, 3, 15): [
+                make_scraped_filing(
+                    cik="1913847",
+                    accession_number="ACC-20F",
+                    form_type="20-F",
+                    filing_date="2024-03-15",
+                    documents=[make_scraped_document(filename="ex8.htm", doc_type="EX-8.1")],
+                ),
+            ],
+        }
+
+        def fake_iter(form_types, start_date, end_date, *, bucket, search_by):
+            calls.append({"start_date": start_date, "end_date": end_date, "search_by": search_by})
+            return list(by_date.get(start_date, []))
+
+        mocker.patch(
+            "idi_corporate_structure.pipeline.iter_filings_by_form_type", side_effect=fake_iter
+        )
+        return calls
+
+    def test_selects_latest_target_filing_per_cik(
+        self, override_pipeline, patch_manifest, patch_iter, mocker
+    ):
+        """Latest target-form accession per CIK is loaded, others drop out.
+
+        Padded manifest CIKs must match normalized config CIKs; non-target
+        forms, older filings, and un-requested CIKs are excluded.
+        """
+        mocker.patch.object(override_pipeline, "_fetch_company_meta", return_value=CompanyMeta())
+
+        filings = override_pipeline.load_input()
+
+        # The manifest key must match the shared lib's layout: {bucket}/sec/manifest.parquet.
+        manifest_calls = [
+            c.args[0] for c in patch_manifest.call_args_list if "manifest" in str(c.args[0])
+        ]
+        assert manifest_calls == ["s3://test-bucket/sec/manifest.parquet"]
+        assert {f.accession_number for f in filings} == {"ACC-NEW", "ACC-20F"}
+        assert len(filings) == 2  # at most one filing per CIK
+        # One single-day filing_date query per distinct target date.
+        assert patch_iter == [
+            {
+                "start_date": datetime.date(2024, 2, 1),
+                "end_date": datetime.date(2024, 2, 1),
+                "search_by": "filing_date",
+            },
+            {
+                "start_date": datetime.date(2024, 3, 15),
+                "end_date": datetime.date(2024, 3, 15),
+                "search_by": "filing_date",
+            },
+        ]
+        assert override_pipeline._override_no_filing == []
+
+    def test_already_processed_latest_filing_is_skipped(
+        self, override_pipeline, patch_manifest, patch_iter, mocker
+    ):
+        """A CIK whose latest filing is already in the output costs no extraction."""
+        mocker.patch.object(
+            override_pipeline, "_load_processed_accessions", return_value={"ACC-NEW", "ACC-20F"}
+        )
+        meta_spy = mocker.patch.object(override_pipeline, "_fetch_company_meta")
+
+        filings = override_pipeline.load_input()
+
+        assert filings == []
+        assert override_pipeline.stats.skipped_filings == 2
+        meta_spy.assert_not_called()
+
+    def test_cik_without_target_filing_is_recorded(
+        self, override_pipeline, patch_manifest, patch_iter, mocker
+    ):
+        """A requested CIK absent from the manifest is tracked, not fatal."""
+        override_pipeline.config.ciks = ("320193", "1913847", "884100")
+        mocker.patch.object(override_pipeline, "_fetch_company_meta", return_value=CompanyMeta())
+
+        filings = override_pipeline.load_input()
+
+        assert {f.accession_number for f in filings} == {"ACC-NEW", "ACC-20F"}
+        assert override_pipeline._override_no_filing == ["884100"]
+
+    def test_no_requested_cik_in_manifest_returns_empty(
+        self, override_pipeline, patch_manifest, patch_iter
+    ):
+        override_pipeline.config.ciks = ("884100",)
+
+        filings = override_pipeline.load_input()
+
+        assert filings == []
+        assert override_pipeline._override_no_filing == ["884100"]
+        assert patch_iter == []  # no manifest hits, no per-date queries

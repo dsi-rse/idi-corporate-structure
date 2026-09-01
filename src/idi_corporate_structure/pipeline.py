@@ -10,7 +10,7 @@ import queue
 import re
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from itertools import islice
 
 # Third party imports
@@ -291,6 +291,10 @@ class SubsidiaryPipeline(Pipeline):
         # Used as the fixed denominator in progress logs. Filings (not documents)
         # are the unit of work so a filing's results are always flushed together.
         self._total_filings = 0
+        # CIKs requested via config.ciks that have no target filing in the
+        # scraper manifest. Populated only in CIK-override mode; surfaced by
+        # the per-CIK coverage report.
+        self._override_no_filing: list[str] = []
         self._company_meta_cache: dict[str, CompanyMeta] = {}
         # accession_number -> reportDate, per CIK. Populated from the same
         # submissions response as the company metadata, so recovering a missing
@@ -425,6 +429,76 @@ class SubsidiaryPipeline(Pipeline):
             or (filing.cik, filing.accession_number) in self.failure_registry
         )
 
+    @staticmethod
+    def _normalize_cik(cik: object) -> str:
+        """Strip leading zeros so padded and unpadded CIK forms compare equal."""
+        return str(cik).lstrip("0") or "0"
+
+    def _iter_override_filings(self) -> Iterator[ScrapedFiling]:
+        """Yield the most recent target filing per CIK in ``config.ciks``.
+
+        Selects candidates from the scraper bucket's ``manifest.parquet``
+        (precedent: the orchestrator's daily mode reads it directly), keeping
+        the max-``filing_date`` accession per requested CIK among
+        ``TARGET_FORM_TYPES``. Full :class:`ScrapedFiling` objects are then
+        loaded through :func:`iter_filings_by_form_type` — one call per
+        distinct filing date, filtered to the selected ``(cik, accession)``
+        pairs — so everything downstream of ``load_input`` is unchanged.
+
+        CIKs with no target filing in the manifest are recorded in
+        ``self._override_no_filing`` and logged; the pipeline can only process
+        filings the scraper has already pulled to S3, so such gaps belong to
+        scraping coverage, not this run.
+
+        Yields:
+            ``ScrapedFiling`` manifests, grouped by filing date in ascending
+            date order.
+        """
+        # "sec/" mirrors the shared lib's _S3_ROOT: iter_filings_by_form_type
+        # resolves the same manifest from the bare bucket name, so this path
+        # must match the key that library writes/reads ({bucket}/sec/manifest.parquet).
+        manifest_df = pd.read_parquet(
+            f"s3://{self.config.sec_bucket}/sec/manifest.parquet",
+            columns=["form_type", "filing_date", "cik", "accession_number"],
+        )
+        candidates = manifest_df[manifest_df["form_type"].isin(TARGET_FORM_TYPES)].copy()
+        candidates["cik_norm"] = candidates["cik"].map(self._normalize_cik)
+        candidates = candidates[candidates["cik_norm"].isin(self.config.ciks)]
+        # The manifest has one row per scraped document; collapse to filings.
+        candidates = candidates.drop_duplicates(subset=["cik_norm", "accession_number"])
+        # ISO date strings sort lexicographically, so tail(1) is the latest.
+        latest = candidates.sort_values("filing_date").groupby("cik_norm", as_index=False).tail(1)
+
+        found_ciks = set(latest["cik_norm"])
+        for cik in self.config.ciks:
+            if cik not in found_ciks:
+                self._override_no_filing.append(cik)
+                self.logger.warning(
+                    "No target filing in manifest for CIK %s; nothing to process", cik
+                )
+
+        targets = {
+            (row.cik_norm, str(row.accession_number)) for row in latest.itertuples(index=False)
+        }
+        self.logger.info(
+            "CIK override: %d of %d requested CIKs have a target filing in the manifest",
+            len(found_ciks),
+            len(self.config.ciks),
+        )
+
+        for filing_date_str in sorted(latest["filing_date"].astype(str).unique()):
+            day = datetime.date.fromisoformat(filing_date_str)
+            for scraped_filing in iter_filings_by_form_type(
+                form_types=TARGET_FORM_TYPES,
+                start_date=day,
+                end_date=day,
+                bucket=self.config.sec_bucket,
+                search_by="filing_date",
+            ):
+                key = (self._normalize_cik(scraped_filing.cik), scraped_filing.accession_number)
+                if key in targets:
+                    yield scraped_filing
+
     def load_input(self) -> list[Filing]:
         """Load input data from the SEC and return a list of filings.
 
@@ -439,13 +513,16 @@ class SubsidiaryPipeline(Pipeline):
         """
         processed_accessions = self._load_processed_accessions()
 
-        scraped_filings = iter_filings_by_form_type(
-            form_types=TARGET_FORM_TYPES,
-            start_date=self.config.start_date,
-            end_date=self.config.end_date,
-            bucket=self.config.sec_bucket,
-            search_by="scraped_date",
-        )
+        if self.config.ciks:
+            scraped_filings = self._iter_override_filings()
+        else:
+            scraped_filings = iter_filings_by_form_type(
+                form_types=TARGET_FORM_TYPES,
+                start_date=self.config.start_date,
+                end_date=self.config.end_date,
+                bucket=self.config.sec_bucket,
+                search_by="scraped_date",
+            )
 
         if self._INPUT_SAMPLE_SIZE:
             scraped_filings = islice(scraped_filings, self._INPUT_SAMPLE_SIZE)
