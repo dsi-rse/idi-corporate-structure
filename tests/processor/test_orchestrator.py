@@ -6,7 +6,7 @@ import datetime
 import pandas as pd
 import pytest
 
-from idi_corporate_structure.orchestrator import get_args, get_dates
+from idi_corporate_structure.orchestrator import get_args, get_dates, read_ciks_file
 
 _FULL_ARGS = [
     "orchestrator.py",
@@ -62,6 +62,72 @@ class TestGetArgs:
         args = get_args()
 
         assert args.verbose is True
+
+
+_BASE_ARGS = [a for a in _FULL_ARGS if a != "--daily"]
+
+
+class TestCiksOverride:
+    """Tests for the --ciks-override mode: file parsing and arg validation."""
+
+    @pytest.fixture
+    def ciks_file(self, tmp_path):
+        path = tmp_path / "ciks.txt"
+        path.write_text(
+            "# CIKs of interest\n"
+            "0000034088\n"
+            "\n"
+            "93410  # Chevron, trailing comment\n"
+            "0000034088\n"  # duplicate of the first entry
+        )
+        return str(path)
+
+    def test_read_ciks_file_normalizes_and_dedupes(self, ciks_file):
+        assert read_ciks_file(ciks_file) == ("34088", "93410")
+
+    def test_read_ciks_file_rejects_invalid_cik(self, tmp_path):
+        path = tmp_path / "ciks.txt"
+        path.write_text("not-a-cik\n")
+
+        with pytest.raises(argparse.ArgumentTypeError, match="line 1"):
+            read_ciks_file(path)
+
+    def test_read_ciks_file_rejects_missing_file(self, tmp_path):
+        with pytest.raises(argparse.ArgumentTypeError, match="Cannot read"):
+            read_ciks_file(str(tmp_path / "does-not-exist.txt"))
+
+    def test_parses_without_date_range(self, monkeypatch, ciks_file):
+        monkeypatch.setattr("sys.argv", [*_BASE_ARGS, "--ciks-override", ciks_file])
+
+        args = get_args()
+
+        assert args.ciks_override == ("34088", "93410")
+        assert args.start_date is None
+        assert args.end_date is None
+        assert args.daily is False
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            ["--daily"],
+            ["--start-date", "2024-01-01"],
+            ["--end-date", "2024-01-15"],
+            ["--look-back", "7"],
+        ],
+    )
+    def test_conflicts_with_date_modes(self, monkeypatch, ciks_file, extra):
+        monkeypatch.setattr("sys.argv", [*_BASE_ARGS, "--ciks-override", ciks_file, *extra])
+
+        with pytest.raises(SystemExit):
+            get_args()
+
+    def test_empty_ciks_file_errors(self, monkeypatch, tmp_path):
+        path = tmp_path / "ciks.txt"
+        path.write_text("# only comments\n\n")
+        monkeypatch.setattr("sys.argv", [*_BASE_ARGS, "--ciks-override", str(path)])
+
+        with pytest.raises(SystemExit):
+            get_args()
 
 
 class TestGetDates:
