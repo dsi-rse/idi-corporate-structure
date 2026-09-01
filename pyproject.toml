@@ -28,7 +28,10 @@ dependencies = [
     "watchtower>=3.4.0",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
+# A dependency-group (not a [project.optional-dependencies] extra) so the
+# README's `uv sync --all-groups` dev install actually covers it. CI installs
+# with `uv sync --all-extras --all-groups`, which covers either layout.
 dev = [
     "pytest>=8.0.0",
     "pytest-cov>=6.0.0",
@@ -36,8 +39,6 @@ dev = [
     "ruff>=0.8.0",
     "pip-audit>=2.10.0",
 ]
-
-[dependency-groups]
 pulumi = [
     "pulumi>=3.220.0",
     "pulumi-aws>=7.19.0",
