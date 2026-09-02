@@ -10,6 +10,7 @@ The orchestrator is responsible for running the pipeline.
 import argparse
 import datetime
 import os
+import pathlib
 import sys
 
 # Third party imports
@@ -44,6 +45,43 @@ def valid_date(s: str) -> datetime.date:
         raise argparse.ArgumentTypeError(f"Not a valid date: {s!r}") from err
 
 
+def read_ciks_file(path: str) -> tuple[str, ...]:
+    """Parse a CIK-list file into normalized CIKs, for use as an argparse ``type``.
+
+    One CIK per line; blank lines and ``#`` comments (full-line or trailing)
+    are ignored. CIKs are normalized with ``str(int(cik))`` so zero-padded
+    values (e.g. from a spreadsheet export) match the unpadded form used in
+    the scraper manifest.
+
+    Args:
+        path: Path to the CIK-list text file.
+
+    Returns:
+        Tuple of normalized CIK strings, in file order, deduplicated.
+
+    Raises:
+        argparse.ArgumentTypeError: If the file cannot be read or a
+            non-comment line is not a valid integer CIK.
+    """
+    try:
+        lines = pathlib.Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError as err:
+        raise argparse.ArgumentTypeError(f"Cannot read CIK file {path!r}: {err}") from err
+
+    ciks: dict[str, None] = {}  # insertion-ordered de-dupe
+    for lineno, line in enumerate(lines, start=1):
+        entry = line.split("#", 1)[0].strip()
+        if not entry:
+            continue
+        try:
+            ciks[str(int(entry))] = None
+        except ValueError as err:
+            raise argparse.ArgumentTypeError(
+                f"Invalid CIK {entry!r} on line {lineno} of {path}"
+            ) from err
+    return tuple(ciks)
+
+
 def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     """Enforce the pairing argparse can't express on its own.
 
@@ -60,6 +98,12 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         parser.error("--end-date is required when --start-date is given")
     if args.daily and args.end_date:
         parser.error("--end-date cannot be used with --daily")
+    if args.ciks_override is not None and args.end_date:
+        parser.error("--end-date cannot be used with --ciks-override")
+    if args.ciks_override is not None and args.look_back is not None:
+        parser.error("--look-back cannot be used with --ciks-override")
+    if args.ciks_override is not None and not args.ciks_override:
+        parser.error("--ciks-override file contains no CIKs")
     if args.start_date and args.end_date and args.end_date < args.start_date:
         parser.error("--end-date must not be before --start-date")
 
@@ -96,6 +140,15 @@ def get_args() -> argparse.Namespace:
     mode.add_argument("--daily", action="store_true", help="Scrape most recent filing")
 
     mode.add_argument("--start-date", type=valid_date, help="Range start (YYYY-MM-DD)")
+    mode.add_argument(
+        "--ciks-override",
+        type=read_ciks_file,
+        metavar="CIKS_FILE",
+        help=(
+            "Path to a file with one CIK per line (blank lines and # comments ignored); "
+            "process the most recent target filing per CIK instead of a date range"
+        ),
+    )
     parser.add_argument("--end-date", type=valid_date, help="Range end (YYYY-MM-DD)")
 
     parser.add_argument(
@@ -191,12 +244,18 @@ def main() -> None:
         shown = "********************" if key in SENSITIVE_ARGS and value else value
         logger.info("%s = %r", key, shown)
 
-    start_date, end_date = get_dates(args)
-    if pd.isna(start_date) or pd.isna(end_date):
-        logger.error("Could not locate start and end dates from command line arguments.")
-        sys.exit(1)
+    if args.ciks_override is not None:
+        # CIK-override mode has no date range: the pipeline selects the most
+        # recent target filing per CIK from the manifest instead.
+        start_date, end_date = None, None
+        logger.info("CIK override mode: %d CIKs to process", len(args.ciks_override))
+    else:
+        start_date, end_date = get_dates(args)
+        if pd.isna(start_date) or pd.isna(end_date):
+            logger.error("Could not locate start and end dates from command line arguments.")
+            sys.exit(1)
+        logger.info("Searching for date range: %s - %s", start_date, end_date)
 
-    logger.info("Searching for date range: %s - %s", start_date, end_date)
     config = PipelineConfig(
         output_file=args.output_file,
         failure_file=args.failure_file,
@@ -207,6 +266,7 @@ def main() -> None:
         num_workers=args.num_workers,
         checkpoint_every=args.checkpoint_every,
         openai_api_key=args.openai_api_key,
+        ciks=args.ciks_override or (),
     )
     sec_client = SecClient(rate_limit=config.rate_limit, user_agent=args.sec_user_agent)
     extractor = GptExtractor(openai_api_key=config.openai_api_key, model=args.model)

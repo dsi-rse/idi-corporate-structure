@@ -97,10 +97,14 @@ class PipelineConfig:
 
     failure_file: str
     output_file: str
-    start_date: datetime.date
-    end_date: datetime.date
+    # Both dates are None in CIK-override mode, where the pipeline selects the
+    # most recent target filing per CIK instead of scanning a date range.
+    start_date: datetime.date | None
+    end_date: datetime.date | None
     sec_bucket: str
     openai_api_key: str = ""
+    # Normalized (unpadded) CIKs to process. Non-empty enables CIK-override mode.
+    ciks: tuple[str, ...] = ()
     failure_flush_every: int = 50
     checkpoint_every: int = 500
     rate_limit: float = 0.2
