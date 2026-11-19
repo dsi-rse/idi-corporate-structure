@@ -15,7 +15,7 @@ services:
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
       - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:?OPENAI_API_KEY is required}
-      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4.1-nano}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-6-luna}
       # bucket-name/prefix where the sec-scraper wrote SEC data + manifest.parquet
       - SEC_BUCKET_PREFIX=${SEC_BUCKET_PREFIX:?SEC_BUCKET_PREFIX is required (e.g. my-bucket/sec)}
       - SEC_USER_AGENT=${SEC_USER_AGENT:?SEC_USER_AGENT is required (SEC EDGAR contact string)}
