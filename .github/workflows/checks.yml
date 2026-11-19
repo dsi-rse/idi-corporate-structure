@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   checks:
-    uses: dsi-rse/idi-ftm2j-shared/.github/workflows/pipeline-checks.yml@v0.1.12
+    uses: dsi-rse/idi-ftm2j-shared/.github/workflows/pipeline-checks.yml@v0.1.20
     secrets: inherit
     with:
       app-name: corporate-structure
