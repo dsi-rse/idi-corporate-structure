@@ -96,7 +96,7 @@ class GptExtractor(Extractor):
 
     _DOCUMENT_ERROR_STATUS_CODE = 400
     _MAX_COMPLETION_TOKENS = 32768  # surfaces finish_reason="length" when truncation occurs
-    _DEFAULT_MODEL = "gpt-4.1-nano"
+    _DEFAULT_MODEL = "gpt-6-luna"
     _LOW_YIELD_RATIO = 0.6  # per-chunk yield (output rows / input rows)
     # Re-extract a chunk whose yield is below this fraction of its sibling
     # chunks' median yield - a sharp outlier signals mid-document truncation,

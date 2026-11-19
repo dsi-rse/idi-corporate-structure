@@ -13,7 +13,7 @@ config:
 
   idi:openai_model:
     description: OpenAI model ID used for subsidiary extraction
-    default: "gpt-4.1-nano"
+    default: "gpt-6-luna"
 
   idi:sec_user_agent:
     description: "SEC EDGAR User-Agent header — public contact string (Name email@example.com)"

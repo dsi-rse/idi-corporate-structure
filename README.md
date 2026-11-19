@@ -8,7 +8,7 @@ This processor consumes SEC filing data already collected by the upstream **sec-
 
 1. **Load** — read the scraper's `manifest.parquet` from the SEC bucket for the requested date range (or the most recent filings via `--daily`) to enumerate 10-K-family (Exhibit 21) and 20-F-family (Exhibit 8) filings, capturing each filing's submission date and its reporting period (`report_date`); fetch per-company metadata (state of incorporation, business address, tickers, exchanges) from the SEC submissions API
 2. **Retrieval** — load each filing's already-scraped exhibit content from S3 (HTML, plain text, or PDF)
-3. **Extraction** — pass exhibit content to `gpt-4.1-nano` using structured output to parse subsidiary names and incorporation locations. Each subsidiary name is grounded against the exhibit text — exact match, then a punctuation-insensitive match, then a windowed in-order token match for names split across table columns — and names not found in the source are dropped to guard against hallucinations. Output is structured `Subsidiary` records written to Parquet.
+3. **Extraction** — pass exhibit content to `gpt-6-luna` using structured output to parse subsidiary names and incorporation locations. Each subsidiary name is grounded against the exhibit text — exact match, then a punctuation-insensitive match, then a windowed in-order token match for names split across table columns — and names not found in the source are dropped to guard against hallucinations. Output is structured `Subsidiary` records written to Parquet.
 
 Processing tracks permanent failures to disk so interrupted runs do not re-attempt filings that will always fail.
 
@@ -93,7 +93,7 @@ uv run python3 -m src.idi_corporate_structure.orchestrator \
 | `--look-back` | `7` | Daily mode only: days to look back from the latest filing date |
 | `--sec-user-agent` | env `SEC_USER_AGENT` | Required. SEC EDGAR contact string (`Name email`) |
 | `--openai-api-key` | env `OPENAI_API_KEY` | Required. OpenAI API key |
-| `--model` | env `OPENAI_MODEL`, then `gpt-4.1-nano` | OpenAI model ID for extraction |
+| `--model` | env `OPENAI_MODEL`, then `gpt-6-luna` | OpenAI model ID for extraction |
 | `--rate-limit` | `0.2` | Seconds between SEC HTTP requests (SEC limit: 10 req/s) |
 | `--num-workers` | `10` | Number of concurrent GPT extraction worker threads |
 
@@ -132,7 +132,7 @@ The container runs `--daily` mode by default (see `compose.yml`), reading SEC in
 
 | Variable | Default | Description |
 |---|---|---|
-| `OPENAI_MODEL` | `gpt-4.1-nano` | OpenAI model ID for extraction |
+| `OPENAI_MODEL` | `gpt-6-luna` | OpenAI model ID for extraction |
 | `OUTPUT_FILE` | `/data/output/latest.parquet` | Container-side path for Parquet output |
 | `FAILURE_FILE` | `/data/failures/failures.json` | Container-side path for failures JSON |
 | `RATE_LIMIT` | `0.2` | Seconds between SEC HTTP requests |
@@ -239,7 +239,7 @@ uv run --group pulumi pulumi up
 | `idi:sec_user_agent` | — | Required. SEC EDGAR contact string (`Name email`) |
 | `idi:sec_prefix` | `sec` | Prefix within the shared bucket where the sec-scraper wrote SEC data; combined with the bucket name to form `--sec-bucket-prefix` |
 | `idi:database_prefix` | `database` | Prefix within the shared bucket for published datasets; output is written to `{bucket}/{database_prefix}/{app_name}/latest.parquet` |
-| `idi:openai_model` | `gpt-4.1-nano` | OpenAI model ID for extraction |
+| `idi:openai_model` | `gpt-6-luna` | OpenAI model ID for extraction |
 | `idi:cron_corporate_structure` | `cron(0 2 * * ? *)` | EventBridge schedule expression |
 | `idi:schedule_enabled` | `false` | Enable the EventBridge schedule |
 | `idi:cpu` | `1024` | Fargate task CPU units |
@@ -323,7 +323,7 @@ Exhibit Content  (raw text listing subsidiaries)
   │
   │  POST to OpenAI with structured JSON schema (chunked for large exhibits)
   ▼
-GPT Extraction  (gpt-4.1-nano, structured output)
+GPT Extraction  (gpt-6-luna, structured output)
   │
   │  dedupe by name, ground each name against the exhibit text, attach parent metadata
   ▼

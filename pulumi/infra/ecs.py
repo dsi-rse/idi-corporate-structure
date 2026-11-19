@@ -40,7 +40,7 @@ rate_limit = config.config.get("rate_limit") or "0.2"
 num_workers = config.config.get("num_workers") or "10"
 checkpoint_every = config.config.get("checkpoint_every") or "500"
 input_sample_size = config.config.get("input_sample_size") or "0"
-openai_model = config.config.get("openai_model") or "gpt-4.1-nano"
+openai_model = config.config.get("openai_model") or "gpt-6-luna"
 
 # Build S3 paths from the externally managed bucket (name from SSM via config).
 # SEC data is written by the sec-scraper under a prefix in the shared processor
