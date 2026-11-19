@@ -26,3 +26,6 @@ pulumi/.pulumi/
 
 # Local planning notes (refine/breakdown output)
 plans/
+
+# bd workspace gate lock (runtime)
+.beads.gate.lock*
